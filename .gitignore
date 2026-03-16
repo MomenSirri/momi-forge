@@ -1,11 +1,44 @@
+# Virtual environments
 .venv/
 venv/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Environment and secrets
 .env
+.env.*
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
 *.log
+logs/
+
+# OS files
 .DS_Store
 Thumbs.db
+
+# Editor files
+.idea/
+.vscode/
+
+# Temporary files and outputs
 outputs/
 temp/
-node_modules/
+tmp/
+*.tmp
+*_left.png
+*_right.png
+updated_prompt_*.json
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
