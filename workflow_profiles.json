@@ -1,0 +1,61 @@
+{
+  "default": {
+    "upscale_node_id": null,
+    "enhancement_node_id": null,
+    "wrap_up_node_ids": [],
+    "wrap_up_milestones": {},
+    "seedvr_runtime_enabled": false,
+    "upscale_label": "Upscaling",
+    "enhancement_label": "Enhancement",
+    "enhancement_total_from_upscale": true,
+    "enhancement_total_override": null
+  },
+  "My_Other_Workflow": {
+    "upscale_node_id": "77:78",
+    "enhancement_node_id": "80:12",
+    "wrap_up_node_ids": ["80:14", "81:38", "81:13", "97"],
+    "wrap_up_milestones": {
+      "80:14": 0.25,
+      "81:38": 0.4,
+      "81:13": 0.55,
+      "97": 0.75
+    },
+    "seedvr_runtime_enabled": true,
+    "upscale_label": "SeedVR Upscaling",
+    "enhancement_label": "Enhancement",
+    "enhancement_total_from_upscale": true,
+    "enhancement_total_override": null
+  },
+  "5K_Upscale": {
+    "upscale_node_id": "77:78",
+    "enhancement_node_id": "80:12",
+    "wrap_up_node_ids": ["80:14", "81:38", "81:13", "97"],
+    "wrap_up_milestones": {
+      "80:14": 0.25,
+      "81:38": 0.4,
+      "81:13": 0.55,
+      "97": 0.75
+    },
+    "seedvr_runtime_enabled": true,
+    "upscale_label": "SeedVR Upscaling",
+    "enhancement_label": "Enhancement",
+    "enhancement_total_from_upscale": true,
+    "enhancement_total_override": null
+  },
+  "Pro Upscaler": {
+    "upscale_node_id": "77:78",
+    "enhancement_node_id": "80:12",
+    "wrap_up_node_ids": ["80:14", "81:38", "81:13", "97"],
+    "wrap_up_milestones": {
+      "80:14": 0.25,
+      "81:38": 0.4,
+      "81:13": 0.55,
+      "97": 0.75
+    },
+    "seedvr_runtime_enabled": true,
+    "upscale_label": "SeedVR Upscaling",
+    "enhancement_label": "Enhancement",
+    "enhancement_total_from_upscale": true,
+    "enhancement_total_override": null
+  }
+}

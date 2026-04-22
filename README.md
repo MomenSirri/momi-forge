@@ -109,6 +109,109 @@ SAVE_DEBUG_PROMPT_JSON=0
 - The RunPod ID here should be your **serverless endpoint ID**.
 - `users.db` is created automatically if it does not exist.
 
+## User management (company sign-in)
+
+The app now supports internal BrickVisual sign-in and only accepts `@brickvisual.com` users.
+
+User records are stored in `users.db` table `users` with:
+- `email`
+- `pwd_hash` (bcrypt)
+- `role` (`user` or `admin`)
+- `is_active` (1/0)
+
+Use the built-in admin CLI:
+
+```powershell
+python manage_users.py --help
+```
+
+### 1) Add (or update) a user + set password
+
+```powershell
+python manage_users.py upsert --email john.smith@brickvisual.com --role user
+```
+
+It will prompt securely for password and confirmation.
+
+### 2) Set/reset password
+
+```powershell
+python manage_users.py set-password --email john.smith@brickvisual.com
+```
+
+### 3) Grant/remove admin role
+
+```powershell
+python manage_users.py set-role --email john.smith@brickvisual.com --role admin
+python manage_users.py set-role --email john.smith@brickvisual.com --role user
+```
+
+### 4) Activate/deactivate account
+
+```powershell
+python manage_users.py activate --email john.smith@brickvisual.com
+python manage_users.py deactivate --email john.smith@brickvisual.com
+```
+
+### 5) Inspect users
+
+```powershell
+python manage_users.py show --email john.smith@brickvisual.com
+python manage_users.py list
+python manage_users.py list --active-only
+python manage_users.py list --role admin
+```
+
+### 6) Avatar mapping
+
+For profile pictures, place files in:
+
+```text
+bricker_image/<email_prefix>.png
+```
+
+Example:
+
+```text
+john.smith@brickvisual.com -> bricker_image/john.smith.png
+
+## One-click startup (Windows)
+
+Use:
+
+```bat
+start_momi_forge.bat
+```
+
+This launches:
+- History Portal (`history_portal`, Node.js) on `http://localhost:8199`
+- Main Gradio app on `http://127.0.0.1:8170`
+
+The launcher also sets:
+- `USER_DB_PATH`
+- `HISTORY_PORTAL_URL`
+- `HISTORY_PORTAL_SSO_SECRET`
+
+so the History iframe can auto sign-in from your existing Gradio session.
+
+If you run manually (without the `.bat`), set the same `HISTORY_PORTAL_SSO_SECRET` value for both processes, otherwise the history portal will ask for a second login.
+```
+
+If not found, the app falls back to `bricker_image/default_avatar.png`.
+
+### Optional: use a specific DB path
+
+```powershell
+python manage_users.py upsert --db "D:\Momi Forge\users.db" --email john.smith@brickvisual.com --role user
+```
+
+You can also set this globally in `.env`:
+
+```env
+USER_DB_PATH=D:\Momi Forge\users.db
+APP_ADMIN_EMAILS=first.admin@brickvisual.com,second.admin@brickvisual.com
+```
+
 ## Running the app
 
 Start the app with:
@@ -124,6 +227,99 @@ http://0.0.0.0:8188
 ```
 
 If that port is busy, change the port in the `launch()` block at the end of the file.
+
+## History portal (custom web UI)
+
+History is now served by a dedicated web app under:
+
+```text
+history_portal/
+├── package.json
+├── server.js
+└── public/
+    ├── index.html
+    ├── styles.css
+    └── app.js
+```
+
+This replaces Gradio widgets for the History surface.  
+Gradio now only embeds the portal as a shell tab.
+
+Architecture details: `HISTORY_PORTAL_ARCHITECTURE.md`
+
+### Start the History portal
+
+```powershell
+cd "D:\Momi Forge\history_portal"
+npm install
+npm start
+```
+
+Or use the helper script from the project root:
+
+```powershell
+.\start_history_portal.ps1
+```
+
+Port conflict handling is built in:
+
+```powershell
+# Default: auto-pick next free port if 8199 is busy
+.\start_history_portal.ps1
+
+# Force-kill existing listener on requested port, then reuse it
+.\start_history_portal.ps1 -Port 8199 -PortConflict Kill
+
+# Fail immediately if requested port is busy
+.\start_history_portal.ps1 -Port 8199 -PortConflict Fail
+```
+
+Default URL:
+
+```text
+http://127.0.0.1:8199
+```
+
+### History portal environment variables
+
+Optional:
+
+```env
+HISTORY_PORTAL_HOST=127.0.0.1
+HISTORY_PORTAL_PORT=8199
+HISTORY_SESSION_TTL_MS=43200000
+HISTORY_COOKIE_SECURE=0
+```
+
+The portal also reads:
+
+```env
+USER_DB_PATH
+COMPANY_EMAIL_DOMAIN
+BRICKER_IMAGE_DIR
+TASK_THUMBNAIL_DIR
+DEFAULT_AVATAR_FILENAME
+```
+
+### Connect Gradio to the portal
+
+In `.env`:
+
+```env
+HISTORY_PORTAL_URL=http://127.0.0.1:8199
+```
+
+### API endpoints (History portal)
+
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
+- `GET /api/history`
+- `GET /api/history/:taskId`
+- `POST /api/history/:taskId/favorite`
+- `GET /api/favorite-categories`
+- `POST /api/favorite-categories`
+- `GET /api/asset?path=...`
 
 ## Error handling
 

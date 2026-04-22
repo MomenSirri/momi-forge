@@ -94,36 +94,37 @@ WORKFLOW_DEBUG_JSON_DIR = Path(
 )
 
 
-# Workflow nodes used by the Gradio routing logic.
-NODE_IMAGE_INPUT = "72"
-NODE_MASK_INPUT = "73"
-NODE_MASK_SWITCH = "331"
-NODE_MASK_DRAWN_CONTEXT = "332"
-NODE_MASK_EMPTY_CONTEXT = "333"
+# Workflow nodes used by the Gradio routing logic (workflow_api_flux_dev_1.19).
+NODE_IMAGE_INPUT = "63"
+NODE_MASK_INPUT = "86"
+NODE_MASK_ROUTER = "13"
+NODE_MASK_ROUTE_DRAWN = "88"
+NODE_MASK_ROUTE_EMPTY = "85"
 
-NODE_SD_SAMPLER = "3"
-NODE_SD_LORA = "19"
-NODE_SD_COMPOSITE = "21"
-NODE_SD_CROP = "26"
+NODE_SD_SAMPLER = "32"
+NODE_SD_LORA = "37"
+NODE_SD_PASS = "66"
+NODE_SD_DECODE = "64"
 
-NODE_FLUX_SAMPLER = "143"
-NODE_FLUX_BLEND = "111"
-NODE_FLUX_COMPOSITE = "286"
-NODE_FLUX_RESIZE = "316"
-NODE_FLUX_CROP = "291"
+NODE_ADV_PREP = "79"
+NODE_ADV_PASS = "69"
+NODE_FLUX_RANDOM_NOISE = "26"
+NODE_FLUX_SCHEDULER = "23"
+NODE_FLUX_SAMPLER = "22"
+NODE_FLUX_DECODE = "21"
+NODE_IMAGE_BATCH = "12"
+NODE_FLUX_BLEND = "74"
 
-NODE_BODY_SAMPLER_1 = "133"
-NODE_BODY_SAMPLER_2 = "132"
-NODE_BODY_COMPOSITE = "662"
-NODE_BODY_RESIZE = "658"
-NODE_BODY_CROP = "651"
+NODE_BODY_RESIZE = "53"
+NODE_BODY_SAMPLER_1 = "52"  # body
+NODE_BODY_SAMPLER_2 = "54"  # face
 
-NODE_SAVE_IMAGE = "647"
-NODE_PROMPT_TEXT = "8"
-NODE_QWEN_PROMPT = "641"
-
-NODE_SD_DECODE = "4"
-NODE_FLUX_DECODE = "108"
+NODE_STITCH = "82"
+NODE_SAVE_IMAGE = "83"
+NODE_QWEN_PROMPT = "33"
+NODE_QWEN_MERGE = "30"
+NODE_PROMPT_TEXT = "35"
+TILE_DIVISOR_PX = 900
 
 COMFY_LOG_PATTERN = re.compile(r"^\[comfy-log\]\[(?P<phase>[^\]]+)\]\s*(?P<message>.*)$")
 NODE_PROGRESS_PATTERN = re.compile(
@@ -186,41 +187,39 @@ SAMPLER_NODE_TO_STAGE = {
     NODE_BODY_SAMPLER_2: STAGE_FACE,
 }
 NODE_STAGE_HINTS = {
-    NODE_SD_CROP: STAGE_GENERAL,
+    NODE_MASK_ROUTER: STAGE_GENERAL,
+    NODE_SD_PASS: STAGE_GENERAL,
     NODE_SD_SAMPLER: STAGE_GENERAL,
     NODE_SD_DECODE: STAGE_GENERAL,
-    NODE_SD_COMPOSITE: STAGE_GENERAL,
-    NODE_FLUX_RESIZE: STAGE_ADVANCE,
+    NODE_ADV_PREP: STAGE_ADVANCE,
+    NODE_ADV_PASS: STAGE_ADVANCE,
     NODE_FLUX_SAMPLER: STAGE_ADVANCE,
     NODE_FLUX_DECODE: STAGE_ADVANCE,
-    NODE_FLUX_COMPOSITE: STAGE_ADVANCE,
     NODE_BODY_RESIZE: STAGE_BODY,
     NODE_BODY_SAMPLER_1: STAGE_BODY,
     NODE_BODY_SAMPLER_2: STAGE_FACE,
-    NODE_BODY_COMPOSITE: STAGE_FACE,
+    NODE_STITCH: STAGE_FACE,
 }
 NODE_STATUS_HINTS = {
-    NODE_SD_CROP: "General Enhancement - preparing masked tiles",
+    NODE_MASK_ROUTER: "General Enhancement - preparing masked tiles",
+    NODE_SD_PASS: "General Enhancement - preparing tiles",
     NODE_SD_SAMPLER: "General Enhancement - sampling tiles",
     NODE_SD_DECODE: "General Enhancement - decoding tiles",
-    NODE_SD_COMPOSITE: "General Enhancement - compositing result",
-    NODE_FLUX_RESIZE: "Advance Details - preparing tiles",
+    NODE_ADV_PREP: "Advance Details - preparing tiles",
+    NODE_ADV_PASS: "Advance Details - preparing tiles",
     NODE_FLUX_SAMPLER: "Advance Details - sampling tiles",
     NODE_FLUX_DECODE: "Advance Details - decoding tiles",
-    NODE_FLUX_COMPOSITE: "Advance Details - compositing result",
     NODE_BODY_RESIZE: "Body Enhancement - preparing detections",
     NODE_BODY_SAMPLER_1: "Body Enhancement - sampling detected persons",
     NODE_BODY_SAMPLER_2: "Face Enhancement - sampling detected faces",
-    NODE_BODY_COMPOSITE: "Face Enhancement - compositing result",
+    NODE_STITCH: "Compositing result...",
     NODE_SAVE_IMAGE: "Saving final image...",
 }
 
 STAGE_WRAP_MILESTONES = {
     NODE_SD_DECODE: 0.20,
     NODE_FLUX_DECODE: 0.45,
-    NODE_SD_COMPOSITE: 0.62,
-    NODE_FLUX_COMPOSITE: 0.76,
-    NODE_BODY_COMPOSITE: 0.86,
+    NODE_STITCH: 0.80,
     NODE_SAVE_IMAGE: 0.93,
 }
 
@@ -235,7 +234,7 @@ SAMPLING_PROGRESS_CEILING = max(
 
 auth_service = get_auth_service()
 APP_ENVIRONMENT = os.getenv("APP_ENVIRONMENT", "seed")
-WORKFLOW_VERSION = os.getenv("WORKFLOW_VERSION_GENERAL", "1.17")
+WORKFLOW_VERSION = os.getenv("WORKFLOW_VERSION_GENERAL", "1.19")
 WORKFLOW_CATEGORY = os.getenv("WORKFLOW_CATEGORY_GENERAL", "enhancement")
 WORKFLOW_TYPE = os.getenv("WORKFLOW_TYPE_GENERAL", "image")
 
@@ -287,6 +286,8 @@ def _resolve_general_workflow_path() -> Path:
     script_dir = Path(__file__).resolve().parent
     candidate_files = [
         GENERAL_WORKFLOW_FILE,
+        "workflow_api_flux_dev_1.19.json",
+        "workflow_api_flux_dev_1.19 .json",
         "workflow_api_flux_dev_1.17.json",
         "workflow_api_flux_dev_1.17 .json",
         "workflow_api_flux.json",
@@ -485,8 +486,10 @@ def _extract_node_id(text: str | None) -> str | None:
 def _estimate_tile_count(width: int, height: int) -> tuple[int, int, int]:
     safe_width = max(int(width or 0), 1)
     safe_height = max(int(height or 0), 1)
-    columns = max(1, math.ceil(safe_width / 900))
-    rows = max(1, math.ceil(safe_height / 900))
+    # Keep this aligned with workflow node `SimpleMath+` (a/b), which
+    # returns `INT` via Python's round(result), not ceil().
+    columns = max(1, int(round(safe_width / TILE_DIVISOR_PX)))
+    rows = max(1, int(round(safe_height / TILE_DIVISOR_PX)))
     return columns, rows, columns * rows
 
 
@@ -983,14 +986,21 @@ def _sync_general_total_with_advance_runtime(tracker: dict[str, Any]) -> None:
 
     advance_total = advance_stage.get("total")
     general_total = general_stage.get("total")
-    if (
-        isinstance(advance_total, int)
-        and advance_total > 0
-        and isinstance(general_total, int)
-        and advance_total > general_total
-    ):
+    advance_done = max(0, int(advance_stage.get("done") or 0))
+
+    if not isinstance(advance_total, int) or advance_total <= 0:
+        return
+
+    if not isinstance(general_total, int) or general_total <= 0 or advance_total > general_total:
         general_stage["total"] = advance_total
-        general_stage["done"] = min(int(general_stage.get("done") or 0), advance_total)
+        general_total = advance_total
+
+    # Both stages operate over the same tile grid; if Advance reports more completed
+    # tiles, General cannot be behind in wrap-up/status snapshots.
+    general_stage["done"] = min(
+        max(int(general_stage.get("done") or 0), advance_done),
+        int(general_total),
+    )
 
 
 def _observe_stage_done_count(
@@ -1309,10 +1319,15 @@ def _connect(prompt: dict[str, Any], target_node: str, input_name: str, source_n
     prompt[target_node]["inputs"][input_name] = [source_node, output_idx]
 
 
-def _set_mask_context(prompt: dict[str, Any], source_context: str) -> None:
-    # Both switch inputs point to the same source so the workflow behaves deterministically.
-    prompt[NODE_MASK_SWITCH]["inputs"]["ctx_01"] = [source_context, 0]
-    prompt[NODE_MASK_SWITCH]["inputs"]["ctx_02"] = [source_context, 0]
+def _set_mask_source(prompt: dict[str, Any], source_mask_node: str) -> None:
+    prompt[NODE_MASK_ROUTER]["inputs"]["mask"] = [source_mask_node, 0]
+
+
+def _disconnect_qwen_caption_path(prompt: dict[str, Any]) -> None:
+    # Disconnect node 33 (Qwen) from downstream prompt composition for body-only mode.
+    merge_inputs = prompt.get(NODE_QWEN_MERGE, {}).get("inputs")
+    if isinstance(merge_inputs, dict):
+        merge_inputs["text_c"] = ""
 
 
 def _apply_branch_routing(
@@ -1322,91 +1337,70 @@ def _apply_branch_routing(
     advance_details: bool,
     body_enhance: bool,
 ) -> None:
-    # General Enhancement block:
-    # The SD1.5 path always starts from the original loaded image through crop node 26.
-    _connect(prompt, NODE_SD_CROP, "image", NODE_IMAGE_INPUT)
+    # Routing follows workflow_api_flux_dev_1.19 rules:
+    # - "A -> B" means node A input points to node B output[0].
+    # - Case 7 provided as "63 -> 83" is applied as SaveImage(83) <- 63.
 
-    # Flux crop source (node 291):
-    # - General Enhancement enabled  -> SD composite (21)
-    # - General Enhancement disabled -> original image (72)
-    _connect(
-        prompt,
-        NODE_FLUX_CROP,
-        "image",
-        NODE_SD_COMPOSITE if general_enhance else NODE_IMAGE_INPUT,
-    )
+    # Default: keep Qwen merge connected unless a specific case disconnects it.
+    merge_inputs = prompt.get(NODE_QWEN_MERGE, {}).get("inputs")
+    if isinstance(merge_inputs, dict):
+        merge_inputs["text_c"] = [NODE_QWEN_PROMPT, 0]
 
-    # Body crop source (node 651):
-    # - Any Advanced Details enabled -> Flux composite (286)
-    # - Otherwise, General Enhancement enabled -> SD composite (21)
-    # - Otherwise -> original image (72)
-    if advance_details:
-        _connect(prompt, NODE_BODY_CROP, "image", NODE_FLUX_COMPOSITE)
-    elif general_enhance:
-        _connect(prompt, NODE_BODY_CROP, "image", NODE_SD_COMPOSITE)
-    else:
-        _connect(prompt, NODE_BODY_CROP, "image", NODE_IMAGE_INPUT)
-
-    # Advance Details block:
-    # Node 316 decides whether Flux receives the SD result or the original image.
-    #
-    # Body Enhancement block:
-    # Node 658 decides whether FaceDetailer receives the Flux result, SD result, or original image.
-    #
-    # Final output routing:
-    # Save Image 647 is pointed at the single branch that should be the visible result.
     if general_enhance and not advance_details and not body_enhance:
-        # Case 1: SD1.5 only
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_SD_COMPOSITE)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_FLUX_COMPOSITE)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_SD_COMPOSITE)
+        # Case 1: Only General Enhancement
+        _connect(prompt, NODE_SD_PASS, "image", NODE_ADV_PREP)        # 66 -> 79
+        _connect(prompt, NODE_IMAGE_BATCH, "images", NODE_SD_DECODE)  # 12 -> 64
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_STITCH)      # 83 -> 82
         return
 
     if (not general_enhance) and advance_details and (not body_enhance):
-        # Case 2: Flux only
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_IMAGE_INPUT)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_FLUX_COMPOSITE)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_FLUX_COMPOSITE)
+        # Case 2: Only Advance Details
+        _connect(prompt, NODE_ADV_PASS, "image", NODE_ADV_PREP)       # 69 -> 79
+        _connect(prompt, NODE_IMAGE_BATCH, "images", NODE_FLUX_DECODE)  # 12 -> 21
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_STITCH)      # 83 -> 82
         return
 
     if (not general_enhance) and (not advance_details) and body_enhance:
-        # Case 3: Body only
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_SD_COMPOSITE)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_IMAGE_INPUT)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_COMPOSITE)
-        return
-
-    if general_enhance and advance_details and body_enhance:
-        # Case 4: SD1.5 -> Flux -> Body
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_SD_COMPOSITE)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_FLUX_COMPOSITE)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_COMPOSITE)
-        return
-
-    if (not general_enhance) and advance_details and body_enhance:
-        # Case 5: Original -> Flux -> Body
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_IMAGE_INPUT)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_FLUX_COMPOSITE)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_COMPOSITE)
-        return
-
-    if general_enhance and (not advance_details) and body_enhance:
-        # Case 6: SD1.5 -> Body
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_SD_COMPOSITE)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_SD_COMPOSITE)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_COMPOSITE)
+        # Case 3: Only Body Enhancement
+        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_IMAGE_INPUT)   # 53 -> 63
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_SAMPLER_2)  # 83 -> 54
+        _disconnect_qwen_caption_path(prompt)  # disconnect node 33 from active path
         return
 
     if general_enhance and advance_details and (not body_enhance):
-        # Case 7: SD1.5 -> Flux
-        _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_SD_COMPOSITE)
-        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_FLUX_COMPOSITE)
-        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_FLUX_COMPOSITE)
+        # Case 4: General Enhancement + Advance Details
+        _connect(prompt, NODE_SD_PASS, "image", NODE_ADV_PREP)         # 66 -> 79
+        _connect(prompt, NODE_ADV_PASS, "image", NODE_SD_DECODE)       # 69 -> 64
+        _connect(prompt, NODE_IMAGE_BATCH, "images", NODE_FLUX_DECODE)  # 12 -> 21
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_STITCH)       # 83 -> 82
         return
 
-    # Fallback when all three options are off: save the original image unchanged.
-    _connect(prompt, NODE_FLUX_RESIZE, "image", NODE_IMAGE_INPUT)
-    _connect(prompt, NODE_BODY_RESIZE, "image", NODE_IMAGE_INPUT)
+    if general_enhance and (not advance_details) and body_enhance:
+        # Case 5: General Enhancement + Body Enhancement
+        _connect(prompt, NODE_SD_PASS, "image", NODE_ADV_PREP)         # 66 -> 79
+        _connect(prompt, NODE_IMAGE_BATCH, "images", NODE_SD_DECODE)   # 12 -> 64
+        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_STITCH)       # 53 -> 82
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_SAMPLER_2)  # 83 -> 54
+        return
+
+    if (not general_enhance) and advance_details and body_enhance:
+        # Case 6: Advance Details + Body Enhancement
+        _connect(prompt, NODE_ADV_PASS, "image", NODE_ADV_PREP)        # 69 -> 79
+        _connect(prompt, NODE_IMAGE_BATCH, "images", NODE_FLUX_DECODE)  # 12 -> 21
+        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_STITCH)       # 53 -> 82
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_SAMPLER_2)  # 83 -> 54
+        return
+
+    if general_enhance and advance_details and body_enhance:
+        # All enabled: chain General -> Advance -> Body
+        _connect(prompt, NODE_SD_PASS, "image", NODE_ADV_PREP)
+        _connect(prompt, NODE_ADV_PASS, "image", NODE_SD_DECODE)
+        _connect(prompt, NODE_IMAGE_BATCH, "images", NODE_FLUX_DECODE)
+        _connect(prompt, NODE_BODY_RESIZE, "image", NODE_STITCH)
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_BODY_SAMPLER_2)
+        return
+
+    # Case 7: None selected -> save original image.
     _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_IMAGE_INPUT)
 
 
@@ -1431,23 +1425,25 @@ def _apply_general_workflow_updates(
     prompt[NODE_MASK_INPUT]["inputs"]["image"] = mask_b64
 
     if has_drawn_mask:
-        _set_mask_context(prompt, NODE_MASK_DRAWN_CONTEXT)
+        _set_mask_source(prompt, NODE_MASK_ROUTE_DRAWN)  # 13 mask -> 88
     else:
-        _set_mask_context(prompt, NODE_MASK_EMPTY_CONTEXT)
+        _set_mask_source(prompt, NODE_MASK_ROUTE_EMPTY)  # 13 mask -> 85
 
     cleaned_prompt = str(custom_prompt or "").strip()
 
     prompt[NODE_PROMPT_TEXT]["inputs"]["text_a"] = cleaned_prompt
-    # prompt[NODE_QWEN_PROMPT]["inputs"]["custom_prompt"] = cleaned_prompt
+    prompt[NODE_QWEN_PROMPT]["inputs"]["custom_prompt"] = cleaned_prompt
 
+    # Seed mapping for workflow_api_flux_dev_1.19
     prompt[NODE_SD_SAMPLER]["inputs"]["seed"] = random.randint(0, 10**12)
-    prompt[NODE_FLUX_SAMPLER]["inputs"]["seed"] = random.randint(0, 10**12)
+    prompt[NODE_FLUX_RANDOM_NOISE]["inputs"]["noise_seed"] = random.randint(0, 10**12)
     prompt[NODE_BODY_SAMPLER_1]["inputs"]["seed"] = random.randint(0, 10**12)
     prompt[NODE_BODY_SAMPLER_2]["inputs"]["seed"] = random.randint(0, 10**12)
 
+    # Parameter mapping for workflow_api_flux_dev_1.19
     prompt[NODE_SD_LORA]["inputs"]["strength_model"] = float(details)
     prompt[NODE_SD_SAMPLER]["inputs"]["denoise"] = float(general_denoise)
-    prompt[NODE_FLUX_SAMPLER]["inputs"]["denoise"] = float(additional_detail_pass)
+    prompt[NODE_FLUX_SCHEDULER]["inputs"]["denoise"] = float(additional_detail_pass)
     prompt[NODE_FLUX_BLEND]["inputs"]["blend_factor"] = float(sharpen)
     prompt[NODE_BODY_SAMPLER_1]["inputs"]["denoise"] = float(body_enhancement_denoise)
     prompt[NODE_BODY_SAMPLER_2]["inputs"]["denoise"] = float(face_enhancement_denoise)
@@ -2118,6 +2114,14 @@ async def cancel_job(job_id: str | None) -> str:
         )
 
 
+def _disable_generate_button() -> dict[str, Any]:
+    return gr.update(interactive=False)
+
+
+def _enable_generate_button() -> dict[str, Any]:
+    return gr.update(interactive=True)
+
+
 def update_general_enhance_controls(general_enhance: bool):
     return [
         gr.update(visible=general_enhance),
@@ -2253,7 +2257,14 @@ with gr.Blocks(theme=my_theme, title=APP_TITLE, css=BOTTOM_PROGRESS_LAYOUT_CSS) 
         generate_button = gr.Button("Generate", scale=3, variant="primary")
         cancel_btn = gr.Button("Cancel", variant="stop", scale=1)
 
-    generate_button.click(
+    generate_event = generate_button.click(
+        fn=_disable_generate_button,
+        inputs=None,
+        outputs=[generate_button],
+        queue=False,
+    )
+
+    generate_event = generate_event.then(
         fn=enhance_image,
         inputs=[
             image_editor,
@@ -2271,11 +2282,23 @@ with gr.Blocks(theme=my_theme, title=APP_TITLE, css=BOTTOM_PROGRESS_LAYOUT_CSS) 
             workflow,
         ],
         outputs=[result_image, status, job_state],
-        concurrency_limit=None,
-        trigger_mode="multiple",
+        concurrency_limit=10,
+        trigger_mode="once",
     )
 
-    cancel_btn.click(fn=cancel_job, inputs=[job_state], outputs=[status])
+    generate_event.then(
+        fn=_enable_generate_button,
+        inputs=None,
+        outputs=[generate_button],
+        queue=False,
+    )
+
+    cancel_btn.click(fn=cancel_job, inputs=[job_state], outputs=[status]).then(
+        fn=_enable_generate_button,
+        inputs=None,
+        outputs=[generate_button],
+        queue=False,
+    )
     General_Enhancement_interface.load(
         fn=_debug_checkbox_visibility_update,
         inputs=None,

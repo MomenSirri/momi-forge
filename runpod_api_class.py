@@ -3,13 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from time import time
+from time import sleep, time
 from typing import Any
 
 import requests
+from requests.exceptions import (
+    ChunkedEncodingError,
+    ConnectionError as RequestsConnectionError,
+    RequestException,
+    SSLError,
+    Timeout as RequestsTimeout,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
+
+RUNPOD_GET_RETRIES = int(os.getenv("RUNPOD_GET_RETRIES", "5"))
+RUNPOD_RETRY_BACKOFF_S = float(os.getenv("RUNPOD_RETRY_BACKOFF_S", "1.0"))
 
 
 class RunpodAPI:
@@ -26,6 +36,8 @@ class RunpodAPI:
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         }
 
         if not self.api_key:
@@ -42,20 +54,47 @@ class RunpodAPI:
         *,
         json_body: dict[str, Any] | None = None,
         timeout: int = 60,
+        retries: int | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         loop = asyncio.get_running_loop()
+        max_attempts = retries if retries is not None else (
+            RUNPOD_GET_RETRIES if method.upper() == "GET" else 1
+        )
 
         def _do_request() -> dict[str, Any]:
-            response = requests.request(
-                method=method,
-                url=url,
-                headers=self.headers,
-                json=json_body,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return response.json()
+            last_error: Exception | None = None
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = requests.request(
+                        method=method,
+                        url=url,
+                        headers=self.headers,
+                        json=json_body,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+                except (
+                    SSLError,
+                    RequestsConnectionError,
+                    RequestsTimeout,
+                    ChunkedEncodingError,
+                ) as err:
+                    last_error = err
+                    is_last_attempt = attempt >= max_attempts
+                    if is_last_attempt:
+                        raise
+                    sleep_s = RUNPOD_RETRY_BACKOFF_S * attempt
+                    sleep(sleep_s)
+                except RequestException as err:
+                    last_error = err
+                    raise
+
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError(f"Request failed unexpectedly for {method} {url}")
 
         return await loop.run_in_executor(None, _do_request)
 
@@ -67,7 +106,16 @@ class RunpodAPI:
         return await self._request_json("POST", "/run", json_body=json_data, timeout=60)
 
     async def status(self, job_id: str) -> dict[str, Any]:
-        return await self._request_json("GET", f"/status/{job_id}", timeout=30)
+        cache_buster = int(time() * 1000)
+        return await self._request_json(
+            "GET", f"/status/{job_id}?_t={cache_buster}", timeout=30
+        )
+
+    async def stream(self, job_id: str) -> dict[str, Any]:
+        cache_buster = int(time() * 1000)
+        return await self._request_json(
+            "GET", f"/stream/{job_id}?_t={cache_buster}", timeout=30
+        )
 
     async def cancel(self, job_id: str) -> dict[str, Any]:
         return await self._request_json("POST", f"/cancel/{job_id}", timeout=30)
@@ -166,8 +214,10 @@ class RunpodAPI:
             if progress is not None:
                 pct = status_response.get("progress")
                 desc = state or "UNKNOWN"
-                if pct is not None:
+                if isinstance(pct, (int, float)):
                     desc += f" ({pct}%)"
+                elif isinstance(pct, str) and pct.strip():
+                    desc += f" ({pct.strip()})"
                 progress(min((i + 1) / max_polls, 0.99), desc=desc)
 
             if state in self.TERMINAL_SUCCESS:

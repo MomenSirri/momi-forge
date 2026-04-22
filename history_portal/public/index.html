@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Momi Forge History Portal</title>
+  <link rel="stylesheet" href="styles.css?v=20260326-storage2">
+</head>
+<body class="hide-profile-header">
+  <div class="root">
+    <section id="loginView" class="auth-shell hidden">
+      <div class="auth-card">
+        <h1>Momi Forge History</h1>
+        <p>BrickVisual internal access only</p>
+        <form id="loginForm" class="auth-form">
+          <label class="field">
+            <span>Company email</span>
+            <input id="emailInput" type="email" placeholder="name.surname@brickvisual.com" required>
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input id="passwordInput" type="password" required>
+          </label>
+          <button type="submit" class="btn btn-primary">Sign in</button>
+          <p id="loginError" class="state-text state-error"></p>
+        </form>
+      </div>
+    </section>
+
+    <section id="appView" class="app hidden">
+      <header class="app-header">
+        <div>
+          <h1>History Library</h1>
+          <p>Asset gallery for generated creations</p>
+        </div>
+        <div class="profile">
+          <img id="userAvatar" alt="profile" class="avatar">
+          <div class="profile-text">
+            <div id="userName" class="name">-</div>
+            <div id="userEmail" class="email">-</div>
+          </div>
+          <button id="logoutBtn" type="button" class="btn btn-ghost">Logout</button>
+        </div>
+      </header>
+
+      <section class="toolbar">
+        <div class="toolbar-row">
+          <div class="toolbar-left">
+            <label class="compact-field">
+              <select id="scopeSelect">
+                <option value="all">All Creations</option>
+                <option value="favorites">Favorites</option>
+                <option value="uncategorized">Uncategorized</option>
+              </select>
+            </label>
+
+            <label class="compact-field">
+              <select id="typeSelect"></select>
+            </label>
+
+            <label class="compact-field">
+              <select id="datePresetSelect">
+                <option value="all_time">Date screening</option>
+                <option value="today" selected>Today</option>
+                <option value="last_7_days">Last 7 days</option>
+                <option value="last_30_days">Last 30 days</option>
+                <option value="custom">Custom range</option>
+              </select>
+            </label>
+
+            <label class="check-inline">
+              <input id="favoritesCheckbox" type="checkbox">
+              <span>Favorites</span>
+            </label>
+
+            <label class="check-inline">
+              <input id="hideFolderContentCheckbox" type="checkbox">
+              <span>Hide project contents</span>
+            </label>
+          </div>
+
+          <div class="toolbar-right">
+            <label class="compact-field compact-right">
+              <select id="sortSelect">
+                <option value="newest">Latest</option>
+                <option value="oldest">Oldest</option>
+                <option value="duration_desc">Longest runtime</option>
+                <option value="duration_asc">Shortest runtime</option>
+              </select>
+            </label>
+
+            <label class="compact-field compact-right">
+              <select id="viewModeSelect">
+                <option value="unified">Unified View</option>
+                <option value="workflow_grouped">Grouped by Workflow</option>
+                <option value="collection_grouped">Grouped by Project</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <details id="advancedFilters" class="advanced-filters">
+          <summary>Advanced filters</summary>
+          <div class="toolbar-row toolbar-row-secondary">
+            <label class="field search-field">
+              <span>Search</span>
+              <input id="searchInput" type="text" placeholder="Search workflow, task ID, request ID">
+            </label>
+
+            <label class="field small-field">
+              <span>Status</span>
+              <select id="statusSelect"></select>
+            </label>
+
+            <label class="field small-field">
+              <span>Favorite category</span>
+              <select id="favoriteCategoryFilterSelect"></select>
+            </label>
+
+            <label class="field small-field">
+              <span>From (UTC)</span>
+              <input id="dateFromInput" type="date">
+            </label>
+
+            <label class="field small-field">
+              <span>To (UTC)</span>
+              <input id="dateToInput" type="date">
+            </label>
+
+            <label class="field compact-size">
+              <span>Page size</span>
+              <select id="pageSizeSelect">
+                <option value="24">24</option>
+                <option value="36" selected>36</option>
+                <option value="48">48</option>
+                <option value="72">72</option>
+              </select>
+            </label>
+
+            <div class="toolbar-buttons">
+              <button id="applyFiltersBtn" type="button" class="btn btn-primary">Apply</button>
+              <button id="resetFiltersBtn" type="button" class="btn">Reset</button>
+              <button id="refreshBtn" type="button" class="btn">Refresh</button>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section id="selectionBar" class="selection-bar hidden">
+        <div id="selectionCount">0 selected</div>
+        <label class="field selection-field">
+          <span>Assign to Project</span>
+          <select id="bulkCollectionSelect"></select>
+        </label>
+        <button id="bulkAssignBtn" type="button" class="btn">Assign</button>
+        <button id="clearSelectionBtn" type="button" class="btn btn-ghost">Clear</button>
+      </section>
+
+      <section class="summary">
+        <div id="summaryPills" class="summary-pills"></div>
+        <p id="statusText" class="state-text">Loading...</p>
+      </section>
+
+      <section id="projectSection" class="section">
+        <div class="section-header">
+          <h2 id="toggleProjectsBtn" class="project-collapse-title" role="button" tabindex="0" aria-expanded="true">
+            <span>Project <span id="folderCount" class="section-count">(0)</span></span>
+            <span class="project-collapse-chevron" aria-hidden="true">▾</span>
+          </h2>
+        </div>
+        <div id="folderGrid" class="folder-grid"></div>
+      </section>
+
+      <section class="section">
+        <div class="section-header">
+          <h2 id="assetsTitle">Uncategorized Creations</h2>
+          <div id="assetsMeta" class="assets-meta"></div>
+        </div>
+        <div id="groupedContainer" class="grouped-container"></div>
+        <div id="emptyState" class="empty-state hidden"></div>
+      </section>
+
+      <section class="pagination">
+        <button id="prevBtn" type="button" class="btn">Previous</button>
+        <span id="pageText">Page 1 / 1</span>
+        <button id="nextBtn" type="button" class="btn">Next</button>
+      </section>
+    </section>
+  </div>
+
+  <div id="detailModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close-modal="1"></div>
+    <div id="detailModalPanel" class="modal-panel">
+      <button id="closeModalBtn" type="button" class="modal-close" aria-label="Close preview">×</button>
+      <div class="modal-layout">
+        <div id="modalPreview" class="modal-preview">
+          <div id="detailImageBackdrop" class="modal-preview-backdrop" aria-hidden="true"></div>
+          <img id="detailImage" alt="history result">
+          <div id="detailPreviewFallback" class="detail-preview-fallback hidden" aria-hidden="true"></div>
+          <div class="detail-overlay-bar">
+            <div class="detail-runtime-orb">
+              <strong id="detailRuntimeOrb">-</strong>
+              <span>runtime</span>
+            </div>
+            <div id="detailProjectChip" class="detail-image-chip detail-image-chip-primary">Project</div>
+            <div id="detailCreatedChip" class="detail-image-chip">Created</div>
+          </div>
+        </div>
+        <aside class="modal-sidebar">
+          <div class="detail-cta">
+            <p class="detail-cta-label">History asset</p>
+            <div class="detail-quick-actions">
+              <a id="openOriginalLink" class="detail-quick-btn" target="_blank" rel="noopener noreferrer" title="Open original asset" aria-label="Open original asset">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M14 5h5v5"></path>
+                  <path d="M10 14 19 5"></path>
+                  <path d="M19 13v4a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"></path>
+                </svg>
+              </a>
+              <a id="downloadLink" class="detail-quick-btn" target="_blank" rel="noopener noreferrer" download title="Download" aria-label="Download">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 4v10"></path>
+                  <path d="M8 10l4 4 4-4"></path>
+                  <path d="M5 18h14"></path>
+                </svg>
+              </a>
+              <button id="copyTaskBtn" type="button" class="detail-quick-btn" title="Copy image link" aria-label="Copy image link">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="9" y="9" width="10" height="10" rx="2"></rect>
+                  <path d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"></path>
+                </svg>
+              </button>
+              <button id="toggleFavoriteBtn" type="button" class="detail-quick-btn favorite-star" title="Add to favorites" aria-label="Add to favorites">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 3.8l2.59 5.24 5.79.84-4.19 4.08.99 5.77L12 16.98 6.82 19.73l.99-5.77-4.19-4.08 5.79-.84L12 3.8z"></path>
+                </svg>
+              </button>
+              <button id="deleteAssetBtn" type="button" class="detail-quick-btn detail-quick-btn-danger" title="Delete asset" aria-label="Delete asset">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 7h16"></path>
+                  <path d="M9 7V5h6v2"></path>
+                  <path d="M8 7l1 12h6l1-12"></path>
+                  <path d="M10 11v6"></path>
+                  <path d="M14 11v6"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="detail-body">
+            <p id="detailKicker" class="detail-kicker">Workflow preview</p>
+            <h3 id="detailTitle">Result details</h3>
+
+            <div class="detail-stat-grid">
+              <div class="detail-stat-card">
+                <span>Output</span>
+                <strong id="detailOutputStat">-</strong>
+              </div>
+
+              <div class="detail-stat-card detail-stat-card-wide">
+                <span>Request ID</span>
+                <strong id="detailRequestLine">-</strong>
+              </div>
+            </div>
+
+            <div class="detail-divider"></div>
+
+            <div class="detail-form-lite">
+              <label class="detail-select-card">
+                <span>Project</span>
+                <select id="collectionAssignSelect"></select>
+              </label>
+
+              <label class="detail-select-card">
+                <span>Favorite category</span>
+                <select id="favoriteCategoryAssignSelect"></select>
+              </label>
+
+              <div class="detail-inline-create">
+                <input id="newCategoryInput" type="text" placeholder="New favorite category">
+                <button id="addCategoryBtn" type="button" class="btn btn-ghost">Add category</button>
+              </div>
+
+              <p id="modalStatusText" class="state-text detail-status"></p>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirmModal" class="confirm-modal hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="confirm-backdrop" data-close-confirm="1"></div>
+    <div class="confirm-panel">
+      <h3 id="confirmTitle">Confirm deletion</h3>
+      <p id="confirmMessage">This action cannot be undone.</p>
+      <div class="confirm-actions">
+        <button id="confirmCancelBtn" type="button" class="btn">Cancel</button>
+        <button id="confirmDeleteBtn" type="button" class="btn btn-danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastHost" class="toast-host" aria-live="polite"></div>
+
+  <script src="app.js?v=20260326-storage2"></script>
+</body>
+</html>

@@ -12,7 +12,7 @@ import secrets
 import time
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
-from typing import Any
+from typing import Any, Callable
 
 # Reduce Gradio/HuggingFace telemetry chatter unless explicitly overridden.
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -23,6 +23,7 @@ import gradio as gr
 import plotly.graph_objects as go
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
 
 from General_Enhancement_v04 import General_Enhancement_interface
 from analytics_store import get_analytics_store
@@ -39,6 +40,11 @@ APP_SSL_ENABLE_MODE = os.getenv("APP_SSL_ENABLE", "auto").strip().lower()
 APP_SSL_CERTFILE = os.getenv("APP_SSL_CERTFILE", "").strip()
 APP_SSL_KEYFILE = os.getenv("APP_SSL_KEYFILE", "").strip()
 APP_SSL_KEYFILE_PASSWORD = os.getenv("APP_SSL_KEYFILE_PASSWORD", "").strip()
+SPLASH_LOTTIE_IFRAME_SRC = os.getenv(
+    "SPLASH_LOTTIE_IFRAME_SRC",
+    "/splash-assets/player.html",
+).strip()
+SPLASH_ASSETS_DIR = Path(__file__).resolve().parent / "splash_assets"
 
 HISTORY_PORTAL_URL = os.getenv("HISTORY_PORTAL_URL", "http://localhost:8199").strip()
 HISTORY_PORTAL_PROXY_PATH = os.getenv("HISTORY_PORTAL_PROXY_PATH", "/history-proxy").strip() or "/history-proxy"
@@ -369,6 +375,102 @@ EMBEDDED_HIDE_CSS = """
   text-align: center;
 }
 
+.momi-splash-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(circle at 20% 20%, rgba(0, 214, 255, 0.14), transparent 45%),
+    radial-gradient(circle at 80% 30%, rgba(65, 112, 255, 0.18), transparent 50%),
+    linear-gradient(180deg, #03070f 0%, #050913 100%);
+  opacity: 1;
+  visibility: visible;
+  animation: momi-splash-fadeout 0.55s ease 3.2s forwards;
+  transition: opacity 0.45s ease, visibility 0.45s ease;
+}
+
+.momi-splash-overlay.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.momi-splash-card {
+  min-width: 280px;
+  max-width: 540px;
+  padding: 28px 30px 22px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(7, 12, 22, 0.86);
+  box-shadow:
+    0 18px 64px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(8px);
+  text-align: center;
+}
+
+.momi-splash-brand {
+  margin: 0;
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+  font-size: 34px;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  color: #f6f8ff;
+}
+
+.momi-splash-sub {
+  margin: 8px 0 0;
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  color: #9db0ca;
+}
+
+.momi-splash-lottie-wrap {
+  width: 220px;
+  height: 220px;
+  margin: 10px auto 8px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(5, 8, 14, 0.65);
+}
+
+.momi-splash-lottie {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  pointer-events: none;
+}
+
+.momi-splash-loader {
+  width: 42px;
+  height: 42px;
+  margin: 18px auto 0;
+  border-radius: 50%;
+  border: 3px solid rgba(79, 112, 255, 0.25);
+  border-top-color: #66d7ff;
+  animation: momi-spin 0.9s linear infinite;
+}
+
+@keyframes momi-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes momi-splash-fadeout {
+  to {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+  }
+}
+
 @media (max-width: 1100px) {
   .admin-kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -560,6 +662,44 @@ def _embedded_mode_detector_html() -> str:
       window.addEventListener("beforeunload", () => observer.disconnect(), { once: true });
     })();
     </script>
+    """
+
+
+def _app_splash_html() -> str:
+    lottie_src = (SPLASH_LOTTIE_IFRAME_SRC or "").strip()
+    if lottie_src.startswith("/splash-assets/player.html"):
+        player_file = SPLASH_ASSETS_DIR / "player.html"
+        if player_file.is_file():
+            cache_buster = int(player_file.stat().st_mtime)
+            separator = "&" if "?" in lottie_src else "?"
+            lottie_src = f"{lottie_src}{separator}v={cache_buster}"
+
+    lottie_embed = html.escape(lottie_src, quote=True)
+    lottie_html = ""
+    loader_html = "<div class=\"momi-splash-loader\"></div>"
+    if lottie_embed:
+        lottie_html = f"""
+        <div class="momi-splash-lottie-wrap" aria-hidden="true">
+          <iframe
+            class="momi-splash-lottie"
+            src="{lottie_embed}"
+            loading="eager"
+            referrerpolicy="no-referrer"
+            allowfullscreen
+          ></iframe>
+        </div>
+        """
+        loader_html = ""
+
+    return f"""
+    <div id="momi-splash" class="momi-splash-overlay" aria-live="polite" aria-label="Loading Momi-AI">
+      <div class="momi-splash-card">
+        <h1 class="momi-splash-brand">Momi-AI</h1>
+        <p class="momi-splash-sub">Preparing your workspace...</p>
+        {lottie_html}
+        {loader_html}
+      </div>
+    </div>
     """
 
 
@@ -872,6 +1012,21 @@ def _base_plot_layout(title: str) -> dict[str, Any]:
     }
 
 
+def _empty_admin_plots() -> tuple[None, None, None]:
+    return (None, None, None)
+
+
+def _safe_plot_render(plot_factory: Callable[[], go.Figure]) -> go.Figure | None:
+    try:
+        figure = plot_factory()
+        # Gradio serializes Plot values through Plotly's JSON export path.
+        # Validate here so runtime dependency issues do not break app loading.
+        figure.to_json()
+        return figure
+    except Exception:
+        return None
+
+
 def _build_trend_plot(trend_rows: list[dict[str, Any]]) -> go.Figure:
     fig = go.Figure()
     if not trend_rows:
@@ -1112,21 +1267,33 @@ def _render_failures_table_html(rows: list[dict[str, Any]], search_query: str) -
     """
 
 
-def _build_admin_dashboard(days: int, search_query: str) -> tuple[str, str, go.Figure, go.Figure, go.Figure, str, str]:
+def _build_admin_dashboard(
+    days: int, search_query: str
+) -> tuple[str, str, go.Figure | None, go.Figure | None, go.Figure | None, str, str]:
     dashboard = store.get_admin_dashboard(days=days, limit=ADMIN_DASHBOARD_TABLE_LIMIT)
     summary = dashboard.get("summary", {})
     trend_rows = dashboard.get("trend", [])
     workflow_rows = dashboard.get("workflows", [])
     users_rows = dashboard.get("top_users", [])
     failures_rows = dashboard.get("recent_failures", [])
-    status_text = f"<p class='admin-status-line'>Admin analytics is active. Window: last {days} day(s).</p>"
+    trend_plot = _safe_plot_render(lambda: _build_trend_plot(trend_rows))
+    workflow_plot = _safe_plot_render(lambda: _build_workflow_distribution_plot(workflow_rows))
+    performance_plot = _safe_plot_render(lambda: _build_performance_plot(workflow_rows))
+
+    if trend_plot is None or workflow_plot is None or performance_plot is None:
+        status_text = (
+            f"<p class='admin-status-line'>Admin analytics is active. Window: last {days} day(s). "
+            "Chart rendering is currently unavailable on this server runtime.</p>"
+        )
+    else:
+        status_text = f"<p class='admin-status-line'>Admin analytics is active. Window: last {days} day(s).</p>"
 
     return (
         status_text,
         _build_kpi_cards_html(summary, days=days),
-        _build_trend_plot(trend_rows),
-        _build_workflow_distribution_plot(workflow_rows),
-        _build_performance_plot(workflow_rows),
+        trend_plot,
+        workflow_plot,
+        performance_plot,
         _render_users_table_html(users_rows, search_query),
         _render_failures_table_html(failures_rows, search_query),
     )
@@ -1136,13 +1303,14 @@ def _load_portal_data(request: gr.Request):
     history_base_url = _resolve_history_portal_base_url(request)
     email = getattr(request, "username", None)
     if not email:
+        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
         return (
             _topbar_html("-", "Unknown User", None),
             "<p class='admin-status-line'>Admin access is unavailable.</p>",
             "",
-            _build_trend_plot([]),
-            _build_workflow_distribution_plot([]),
-            _build_performance_plot([]),
+            trend_plot,
+            workflow_plot,
+            performance_plot,
             _render_users_table_html([], ""),
             _render_failures_table_html([], ""),
             _history_portal_html(history_base_url),
@@ -1167,9 +1335,7 @@ def _load_portal_data(request: gr.Request):
     else:
         admin_hint = "<p class='admin-status-line'>Admin analytics is restricted to admin users.</p>"
         admin_summary = ""
-        trend_plot = _build_trend_plot([])
-        workflow_plot = _build_workflow_distribution_plot([])
-        performance_plot = _build_performance_plot([])
+        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
         users_table_html = _render_users_table_html([], "")
         failures_table_html = _render_failures_table_html([], "")
 
@@ -1190,24 +1356,26 @@ def _load_portal_data(request: gr.Request):
 def _refresh_admin(date_range: str, search_query: str, request: gr.Request):
     email = getattr(request, "username", None)
     if not email:
+        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
         return (
             "<p class='admin-status-line'>Admin access is unavailable.</p>",
             "",
-            _build_trend_plot([]),
-            _build_workflow_distribution_plot([]),
-            _build_performance_plot([]),
+            trend_plot,
+            workflow_plot,
+            performance_plot,
             _render_users_table_html([], ""),
             _render_failures_table_html([], ""),
         )
 
     identity = auth_service.get_identity(email)
     if str(getattr(identity, "role", "") or "").strip().lower() != "admin":
+        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
         return (
             "<p class='admin-status-line'>Admin analytics is restricted to admin users.</p>",
             "",
-            _build_trend_plot([]),
-            _build_workflow_distribution_plot([]),
-            _build_performance_plot([]),
+            trend_plot,
+            workflow_plot,
+            performance_plot,
             _render_users_table_html([], ""),
             _render_failures_table_html([], ""),
         )
@@ -1217,6 +1385,7 @@ def _refresh_admin(date_range: str, search_query: str, request: gr.Request):
 
 
 with gr.Blocks(title=APP_TITLE, css=EMBEDDED_HIDE_CSS) as app:
+    gr.HTML(_app_splash_html())
     gr.HTML(_embedded_mode_detector_html())
 
     user_header = gr.HTML(_topbar_html("-", "Loading", None), elem_classes=["app-shell-header"])
@@ -1284,6 +1453,21 @@ with gr.Blocks(title=APP_TITLE, css=EMBEDDED_HIDE_CSS) as app:
             history_portal_shell,
             admin_tab,
         ],
+        js="""
+        () => {
+          const splash = document.getElementById("momi-splash");
+          if (!splash) {
+            return;
+          }
+          splash.classList.add("is-hidden");
+          window.setTimeout(() => {
+            const current = document.getElementById("momi-splash");
+            if (current) {
+              current.remove();
+            }
+          }, 700);
+        }
+        """,
     )
 
     refresh_admin_btn.click(
@@ -1333,6 +1517,9 @@ def _create_server_app() -> FastAPI:
     server_app = FastAPI()
     proxy_path = _normalized_history_proxy_path()
     upstream_base = _history_portal_upstream_base_url().rstrip("/")
+
+    if SPLASH_ASSETS_DIR.is_dir():
+        server_app.mount("/splash-assets", StaticFiles(directory=str(SPLASH_ASSETS_DIR)), name="splash-assets")
 
     hop_by_hop_headers = {
         "connection",
