@@ -1,0 +1,613 @@
+{
+  "76": {
+    "inputs": {
+      "image": "flux2_output_e0j90r5j (1).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "121": {
+    "inputs": {
+      "image": "0001 (1).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "137": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "182",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "138": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "139": {
+    "inputs": {
+      "noise": [
+        "141",
+        0
+      ],
+      "guider": [
+        "145",
+        0
+      ],
+      "sampler": [
+        "138",
+        0
+      ],
+      "sigmas": [
+        "146",
+        0
+      ],
+      "latent_image": [
+        "144",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "140": {
+    "inputs": {
+      "samples": [
+        "139",
+        0
+      ],
+      "vae": [
+        "152",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "141": {
+    "inputs": {
+      "noise_seed": 5334185419188
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "142": {
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "143": {
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "144": {
+    "inputs": {
+      "width": [
+        "147",
+        0
+      ],
+      "height": [
+        "147",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": {
+      "title": "Empty Flux 2 Latent"
+    }
+  },
+  "145": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "142",
+        0
+      ],
+      "positive": [
+        "150",
+        0
+      ],
+      "negative": [
+        "148",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFGGuider"
+    }
+  },
+  "146": {
+    "inputs": {
+      "steps": 4,
+      "width": [
+        "147",
+        0
+      ],
+      "height": [
+        "147",
+        1
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "147": {
+    "inputs": {
+      "image": [
+        "174",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "148": {
+    "inputs": {
+      "conditioning": [
+        "161",
+        0
+      ],
+      "latent": [
+        "149",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "149": {
+    "inputs": {
+      "pixels": [
+        "174",
+        0
+      ],
+      "vae": [
+        "152",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "150": {
+    "inputs": {
+      "conditioning": [
+        "154",
+        0
+      ],
+      "latent": [
+        "149",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "151": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "megapixels": 1,
+      "resolution_steps": 1,
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "152": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "154": {
+    "inputs": {
+      "text": "change the moode to be at night ",
+      "clip": [
+        "143",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "157": {
+    "inputs": {
+      "conditioning": [
+        "148",
+        0
+      ],
+      "latent": [
+        "158",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "158": {
+    "inputs": {
+      "pixels": [
+        "178",
+        0
+      ],
+      "vae": [
+        "152",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "159": {
+    "inputs": {
+      "conditioning": [
+        "150",
+        0
+      ],
+      "latent": [
+        "158",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "160": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": 1,
+      "resolution_steps": 1,
+      "image": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "161": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "143",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "162": {
+    "inputs": {
+      "conditioning": [
+        "157",
+        0
+      ],
+      "latent": [
+        "163",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "163": {
+    "inputs": {
+      "pixels": [
+        "180",
+        0
+      ],
+      "vae": [
+        "152",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "164": {
+    "inputs": {
+      "conditioning": [
+        "159",
+        0
+      ],
+      "latent": [
+        "163",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "165": {
+    "inputs": {
+      "image": "0001 (1).png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "166": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": 1,
+      "resolution_steps": 1,
+      "image": [
+        "165",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "167": {
+    "inputs": {
+      "lora_name": "Klein\\Klein_9B_bvfinish_v01.safetensors",
+      "strength_model": 1,
+      "model": [
+        "142",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "168": {
+    "inputs": {
+      "model_name": "Qwen3VL-4B-Instruct-Q8_0.gguf",
+      "preset_prompt": "🖼️ Detailed Description",
+      "custom_prompt": "",
+      "max_tokens": 512,
+      "keep_model_loaded": true,
+      "seed": 1713137694,
+      "image": [
+        "174",
+        0
+      ]
+    },
+    "class_type": "AILab_QwenVL_GGUF",
+    "_meta": {
+      "title": "QwenVL (GGUF)"
+    }
+  },
+  "169": {
+    "inputs": {
+      "action": "append",
+      "tidy_tags": "yes",
+      "text_a": "Change the mood and lighting of Image 1 to ",
+      "text_b": [
+        "168",
+        0
+      ],
+      "text_c": " to match Image 2 specifically the light direction, shadows, and contrast while keeping all details in Image 1 exactly the same.",
+      "result": {
+        "__value__": [
+          "Change the mood and lighting of Image 1 to, A panoramic aerial view captures a bustling coastal cityscape under bright, direct sunlight, with the camera positioned high above, looking down at an expansive bay and densely packed urban terrain. The foreground features a sweeping turquoise beach lined with rows of white umbrellas and sunbathers, bordered by a curved promenade where pedestrians stroll; a few boats dot the calm blue water. Behind the beach, modern high-rise buildings in beige, tan, and glassy facades rise steeply up a verdant hillside, interspersed with lower residential structures and lush greenery. The background is dominated by rolling, tree-covered mountains under a clear azure sky, with distant cranes hinting at ongoing construction. Shadows cast by the buildings are sharp and defined, indicating midday sun from above, while the overall lighting is cool-toned and saturated. The composition frames the city’s architectural density against the natural curves of the coastline and hills, emphasizing scale and contrast between human development and nature. No individuals are clearly discernible due to distance; the focus remains on the sweeping urban landscape and its relationship with the sea and mountains., to match Image 2 specifically the light direction, shadows, and contrast while keeping all details in Image 1 exactly the same."
+        ]
+      }
+    },
+    "class_type": "StringFunction|pysssss",
+    "_meta": {
+      "title": "String Function 🐍"
+    }
+  },
+  "170": {
+    "inputs": {
+      "image": [
+        "151",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "174": {
+    "inputs": {
+      "width": [
+        "170",
+        0
+      ],
+      "height": [
+        "170",
+        1
+      ],
+      "interpolation": "lanczos",
+      "method": "pad",
+      "condition": "always",
+      "multiple_of": 32,
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "177": {
+    "inputs": {
+      "image": [
+        "160",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "178": {
+    "inputs": {
+      "width": [
+        "177",
+        0
+      ],
+      "height": [
+        "177",
+        1
+      ],
+      "interpolation": "lanczos",
+      "method": "pad",
+      "condition": "always",
+      "multiple_of": 32,
+      "image": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "179": {
+    "inputs": {
+      "image": [
+        "166",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "180": {
+    "inputs": {
+      "width": [
+        "179",
+        0
+      ],
+      "height": [
+        "179",
+        1
+      ],
+      "interpolation": "lanczos",
+      "method": "pad",
+      "condition": "always",
+      "multiple_of": 32,
+      "image": [
+        "165",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "181": {
+    "inputs": {
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "182": {
+    "inputs": {
+      "width": [
+        "181",
+        0
+      ],
+      "height": [
+        "181",
+        1
+      ],
+      "interpolation": "lanczos",
+      "method": "fill / crop",
+      "condition": "always",
+      "multiple_of": 1,
+      "image": [
+        "140",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  }
+}

@@ -10,7 +10,10 @@ from pathlib import Path
 import bcrypt
 
 from analytics_store import AnalyticsStore
-from auth_service import COMPANY_DOMAIN, email_prefix, normalize_email
+from auth_service import COMPANY_DOMAIN, VALID_ROLES, email_prefix, normalize_email
+
+
+ROLE_CHOICES = sorted(VALID_ROLES)
 
 
 def _resolve_db_path(path_arg: str | None) -> Path:
@@ -215,7 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shared_args(p_upsert)
     p_upsert.add_argument("--email", required=True, help=f"Company email (@{COMPANY_DOMAIN})")
     p_upsert.add_argument("--password", help="Password (omit to prompt securely)")
-    p_upsert.add_argument("--role", choices=["user", "admin"], default="user")
+    p_upsert.add_argument("--role", choices=ROLE_CHOICES, default="user")
     p_upsert.add_argument("--inactive", action="store_true", help="Create/update as inactive")
     p_upsert.add_argument("--display-name", help="Override display name")
     p_upsert.add_argument("--avatar-filename", help="Store avatar filename (optional)")
@@ -228,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_role = sub.add_parser("set-role", help="Change user role")
     _add_shared_args(p_role)
     p_role.add_argument("--email", required=True)
-    p_role.add_argument("--role", choices=["user", "admin"], required=True)
+    p_role.add_argument("--role", choices=ROLE_CHOICES, required=True)
 
     p_activate = sub.add_parser("activate", help="Activate a user")
     _add_shared_args(p_activate)
@@ -244,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list", help="List users")
     _add_shared_args(p_list)
-    p_list.add_argument("--role", choices=["user", "admin"], help="Filter by role")
+    p_list.add_argument("--role", choices=ROLE_CHOICES, help="Filter by role")
     p_list.add_argument("--active-only", action="store_true", help="Show only active users")
 
     return parser

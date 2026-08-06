@@ -2143,8 +2143,16 @@ def update_body_enhance_controls(body_enhance: bool):
     ]
 
 
+def _load_theme():
+    try:
+        return gr.Theme.from_hub("snehilsanyal/scikit-learn")
+    except Exception as error:
+        logger.warning("Falling back to bundled Gradio theme: %s", error)
+        return gr.themes.Soft()
+
+
 script_name = os.path.splitext(os.path.basename(__file__))[0]
-my_theme = gr.Theme.from_hub("snehilsanyal/scikit-learn")
+my_theme = _load_theme()
 BOTTOM_PROGRESS_LAYOUT_CSS = """
 .bottom-progress-row {
     margin-top: 12px;

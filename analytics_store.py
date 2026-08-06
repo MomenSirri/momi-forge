@@ -63,6 +63,19 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 class AnalyticsStore:
     """Centralized persistence layer for auth profiles, task lifecycle and analytics."""
 
@@ -1360,8 +1373,12 @@ class AnalyticsStore:
         }
 
     def get_admin_dashboard(self, *, days: int = 30, limit: int = 50) -> dict[str, Any]:
-        since = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
-        since_iso = since.isoformat(timespec="seconds")
+        window_days = int(days)
+        since_iso = (
+            "0001-01-01T00:00:00+00:00"
+            if window_days <= 0
+            else (datetime.now(timezone.utc) - timedelta(days=max(1, window_days))).isoformat(timespec="seconds")
+        )
         safe_limit = max(10, int(limit))
 
         with self._lock:
@@ -1453,7 +1470,7 @@ class AnalyticsStore:
         success_rate = (completed_tasks / total_tasks * 100.0) if total_tasks else 0.0
 
         return {
-            "window_days": int(days),
+            "window_days": window_days,
             "summary": {
                 "total_tasks": total_tasks,
                 "completed_tasks": completed_tasks,
@@ -1466,6 +1483,217 @@ class AnalyticsStore:
             "workflows": [dict(row) for row in workflow_rows],
             "top_users": [dict(row) for row in top_users_rows],
             "recent_failures": [dict(row) for row in failures_rows],
+        }
+
+    def get_admin_after_hours_tasks(
+        self,
+        *,
+        days: int = 30,
+        group_by: str = "day",
+        limit: int = 120,
+        after_hour: int = 18,
+    ) -> dict[str, Any]:
+        window_days = int(days)
+        since_iso = (
+            "0001-01-01T00:00:00+00:00"
+            if window_days <= 0
+            else (datetime.now(timezone.utc) - timedelta(days=max(1, window_days))).isoformat(timespec="seconds")
+        )
+        safe_group_by = str(group_by or "day").strip().lower()
+        if safe_group_by not in {"day", "week", "month"}:
+            safe_group_by = "day"
+        safe_limit = max(10, int(limit))
+        safe_after_hour = max(0, min(23, int(after_hour)))
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    task_id,
+                    request_id,
+                    user_email,
+                    user_prefix,
+                    user_display_name,
+                    workflow_name,
+                    status,
+                    total_duration_ms,
+                    submitted_at,
+                    finished_at,
+                    COALESCE(finished_at, submitted_at, created_at) AS handled_at
+                FROM tasks
+                WHERE COALESCE(finished_at, submitted_at, created_at) >= ?
+                    AND COALESCE(is_deleted, 0) = 0
+                ORDER BY COALESCE(finished_at, submitted_at, created_at) DESC
+                """,
+                (since_iso,),
+            ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            handled_dt = _parse_iso_datetime(record.get("handled_at"))
+            if handled_dt is None:
+                continue
+            local_dt = handled_dt.astimezone()
+            if local_dt.hour < safe_after_hour:
+                continue
+
+            if safe_group_by == "week":
+                iso_year, iso_week, _ = local_dt.isocalendar()
+                group_key = f"{iso_year}-W{iso_week:02d}"
+                group_label = f"Week {iso_week:02d}, {iso_year}"
+            elif safe_group_by == "month":
+                group_key = local_dt.strftime("%Y-%m")
+                group_label = local_dt.strftime("%B %Y")
+            else:
+                group_key = local_dt.strftime("%Y-%m-%d")
+                group_label = local_dt.strftime("%Y-%m-%d")
+
+            record["handled_at"] = handled_dt.isoformat(timespec="seconds")
+            record["group_key"] = group_key
+            record["group_label"] = group_label
+            items.append(record)
+            if len(items) >= safe_limit:
+                break
+
+        return {
+            "after_hour": safe_after_hour,
+            "group_by": safe_group_by,
+            "items": items,
+        }
+
+    def get_admin_rush_hour_analytics(
+        self,
+        *,
+        days: int = 30,
+        forecast_days: int = 7,
+    ) -> dict[str, Any]:
+        window_days = int(days)
+        since_iso = (
+            "0001-01-01T00:00:00+00:00"
+            if window_days <= 0
+            else (datetime.now(timezone.utc) - timedelta(days=max(1, window_days))).isoformat(timespec="seconds")
+        )
+        safe_forecast_days = max(1, min(31, int(forecast_days)))
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    user_email,
+                    status,
+                    total_duration_ms,
+                    COALESCE(finished_at, submitted_at, created_at) AS handled_at
+                FROM tasks
+                WHERE COALESCE(finished_at, submitted_at, created_at) >= ?
+                    AND COALESCE(is_deleted, 0) = 0
+                ORDER BY COALESCE(finished_at, submitted_at, created_at) ASC
+                """,
+                (since_iso,),
+            ).fetchall()
+
+        slot_stats: dict[tuple[int, int], dict[str, Any]] = {}
+        daily_slot_counts: dict[tuple[str, int, int], int] = {}
+        weekday_dates: dict[int, set[str]] = {}
+        total_tasks = 0
+
+        for row in rows:
+            record = dict(row)
+            handled_dt = _parse_iso_datetime(record.get("handled_at"))
+            if handled_dt is None:
+                continue
+            local_dt = handled_dt.astimezone()
+            weekday = local_dt.weekday()
+            hour = local_dt.hour
+            date_key = local_dt.strftime("%Y-%m-%d")
+            slot_key = (weekday, hour)
+            slot = slot_stats.setdefault(
+                slot_key,
+                {
+                    "weekday": weekday,
+                    "hour": hour,
+                    "total_tasks": 0,
+                    "completed_tasks": 0,
+                    "failed_tasks": 0,
+                    "duration_sum_ms": 0,
+                    "duration_samples": 0,
+                    "users": set(),
+                },
+            )
+
+            total_tasks += 1
+            slot["total_tasks"] += 1
+            status = str(record.get("status") or "").strip().lower()
+            if status == "completed":
+                slot["completed_tasks"] += 1
+            elif status == "failed":
+                slot["failed_tasks"] += 1
+
+            duration_ms = _safe_int(record.get("total_duration_ms"))
+            if duration_ms is not None and duration_ms > 0:
+                slot["duration_sum_ms"] += duration_ms
+                slot["duration_samples"] += 1
+
+            user_email = str(record.get("user_email") or "").strip().lower()
+            if user_email:
+                slot["users"].add(user_email)
+
+            daily_slot_counts[(date_key, weekday, hour)] = daily_slot_counts.get((date_key, weekday, hour), 0) + 1
+            weekday_dates.setdefault(weekday, set()).add(date_key)
+
+        slots: list[dict[str, Any]] = []
+        for slot in slot_stats.values():
+            duration_samples = int(slot.get("duration_samples") or 0)
+            avg_duration_ms = (
+                int(round(float(slot.get("duration_sum_ms") or 0) / duration_samples))
+                if duration_samples
+                else None
+            )
+            slots.append(
+                {
+                    "weekday": int(slot.get("weekday") or 0),
+                    "hour": int(slot.get("hour") or 0),
+                    "total_tasks": int(slot.get("total_tasks") or 0),
+                    "completed_tasks": int(slot.get("completed_tasks") or 0),
+                    "failed_tasks": int(slot.get("failed_tasks") or 0),
+                    "avg_total_duration_ms": avg_duration_ms,
+                    "active_users": len(slot.get("users") or set()),
+                }
+            )
+
+        slots.sort(key=lambda row: (-int(row.get("total_tasks") or 0), int(row.get("weekday") or 0), int(row.get("hour") or 0)))
+
+        now_local = datetime.now().astimezone()
+        forecast: list[dict[str, Any]] = []
+        for day_offset in range(1, safe_forecast_days + 1):
+            target_dt = now_local + timedelta(days=day_offset)
+            target_weekday = target_dt.weekday()
+            historical_dates = max(1, len(weekday_dates.get(target_weekday, set())))
+            for hour in range(24):
+                historical_total = sum(
+                    count
+                    for (_date_key, weekday, slot_hour), count in daily_slot_counts.items()
+                    if weekday == target_weekday and slot_hour == hour
+                )
+                expected_tasks = historical_total / historical_dates
+                if expected_tasks <= 0:
+                    continue
+                forecast.append(
+                    {
+                        "date": target_dt.strftime("%Y-%m-%d"),
+                        "weekday": target_weekday,
+                        "hour": hour,
+                        "expected_tasks": round(expected_tasks, 2),
+                    }
+                )
+
+        forecast.sort(key=lambda row: (-float(row.get("expected_tasks") or 0), str(row.get("date") or ""), int(row.get("hour") or 0)))
+
+        return {
+            "window_days": window_days,
+            "total_tasks": total_tasks,
+            "slots": slots,
+            "forecast": forecast[:10],
         }
 
 

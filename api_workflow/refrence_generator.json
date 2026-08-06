@@ -1,0 +1,785 @@
+{
+  "10": {
+    "inputs": {
+      "text_positive": ",RAW photo, architecture photography,with vegetalized,cinematic shot, Nikon AF-S 70-200mm f/2.8G ED VR II, long exposure, super realistic, 8k, professional photography",
+      "text_negative": "(worst quality, low quality, illustration, 3d, 2d, painting, cartoons, sketch), open mouth\n\n",
+      "style": "misc-architectural",
+      "log_prompt": "No",
+      "style_positive": true,
+      "style_negative": true
+    },
+    "class_type": "SDXLPromptStyler",
+    "_meta": {
+      "title": "SDXL Prompt Styler"
+    }
+  },
+  "11": {
+    "inputs": {
+      "ckpt_name": "dreamshaperXL_v21TurboDPMSDE.safetensors",
+      "config_name": "Default",
+      "vae_name": "Baked VAE",
+      "clip_skip": 0,
+      "lora1_name": "None",
+      "lora1_model_strength": 0.8,
+      "lora1_clip_strength": 1,
+      "lora2_name": "None",
+      "lora2_model_strength": 0.72,
+      "lora2_clip_strength": 1,
+      "lora3_name": "None",
+      "lora3_model_strength": 1,
+      "lora3_clip_strength": 1,
+      "positive": [
+        "29",
+        0
+      ],
+      "positive_token_normalization": "none",
+      "positive_weight_interpretation": "comfy",
+      "negative": [
+        "10",
+        1
+      ],
+      "negative_token_normalization": "none",
+      "negative_weight_interpretation": "comfy",
+      "empty_latent_width": 1024,
+      "empty_latent_height": 1024,
+      "batch_size": 1,
+      "seed": 582110705673789
+    },
+    "class_type": "ttN pipeLoader",
+    "_meta": {
+      "title": "pipeLoader v1 (Legacy)"
+    }
+  },
+  "12": {
+    "inputs": {
+      "lora_name": "None",
+      "lora_model_strength": 1,
+      "lora_clip_strength": 1,
+      "upscale_method": "None",
+      "factor": 1,
+      "crop": "disabled",
+      "sampler_state": "Sample",
+      "steps": 6,
+      "cfg": 2,
+      "sampler_name": "dpmpp_sde",
+      "scheduler": "karras",
+      "denoise": 0.85,
+      "image_output": "Hide",
+      "save_prefix": "ComfyUI",
+      "seed": 77,
+      "pipe": [
+        "11",
+        0
+      ],
+      "optional_model": [
+        "30",
+        0
+      ],
+      "optional_positive": [
+        "17",
+        0
+      ],
+      "optional_latent": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "ttN pipeKSampler",
+    "_meta": {
+      "title": "pipeKSampler Base"
+    }
+  },
+  "14": {
+    "inputs": {
+      "pixels": [
+        "35",
+        0
+      ],
+      "vae": [
+        "11",
+        5
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "16": {
+    "inputs": {
+      "lora_name": "None",
+      "lora_model_strength": 1,
+      "lora_clip_strength": 1,
+      "upscale_method": "nearest-exact",
+      "factor": 1.5,
+      "crop": "disabled",
+      "sampler_state": "Sample",
+      "steps": 6,
+      "cfg": 2,
+      "sampler_name": "dpmpp_sde",
+      "scheduler": "karras",
+      "denoise": 0.54,
+      "image_output": "Hide",
+      "save_prefix": "ComfyUI",
+      "seed": 77,
+      "pipe": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "ttN pipeKSampler",
+    "_meta": {
+      "title": "pipeKSampler Latent Upscaled"
+    }
+  },
+  "17": {
+    "inputs": {
+      "strength": 0.2,
+      "conditioning": [
+        "20",
+        0
+      ],
+      "control_net": [
+        "21",
+        0
+      ],
+      "image": [
+        "44",
+        0
+      ]
+    },
+    "class_type": "ControlNetApply",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "19": {
+    "inputs": {
+      "low_threshold": 54,
+      "high_threshold": 255,
+      "resolution": 512,
+      "image": [
+        "35",
+        0
+      ]
+    },
+    "class_type": "CannyEdgePreprocessor",
+    "_meta": {
+      "title": "Canny Edge"
+    }
+  },
+  "20": {
+    "inputs": {
+      "strength": 0.2,
+      "conditioning": [
+        "11",
+        2
+      ],
+      "control_net": [
+        "21",
+        0
+      ],
+      "image": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "ControlNetApply",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "21": {
+    "inputs": {
+      "control_net_name": "controlnet-union-sdxl-1.0/diffusion_pytorch_model_promax.safetensors"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet Model"
+    }
+  },
+  "22": {
+    "inputs": {
+      "interpolation": "LANCZOS",
+      "crop_position": "center",
+      "sharpening": 0.2,
+      "image": [
+        "38",
+        0
+      ]
+    },
+    "class_type": "PrepImageForClipVision",
+    "_meta": {
+      "title": "Prep Image For ClipVision"
+    }
+  },
+  "29": {
+    "inputs": {
+      "action": "append",
+      "tidy_tags": "yes",
+      "text_a": [
+        "53",
+        0
+      ],
+      "text_b": [
+        "10",
+        0
+      ],
+      "text_c": ""
+    },
+    "class_type": "StringFunction|pysssss",
+    "_meta": {
+      "title": "String Function 🐍"
+    }
+  },
+  "30": {
+    "inputs": {
+      "weight": 0.5,
+      "weight_type": "strong style transfer",
+      "combine_embeds": "average",
+      "start_at": 0,
+      "end_at": 1,
+      "embeds_scaling": "V only",
+      "model": [
+        "32",
+        0
+      ],
+      "ipadapter": [
+        "32",
+        1
+      ],
+      "image": [
+        "22",
+        0
+      ],
+      "clip_vision": [
+        "31",
+        0
+      ]
+    },
+    "class_type": "IPAdapterAdvanced",
+    "_meta": {
+      "title": "IPAdapter Advanced"
+    }
+  },
+  "31": {
+    "inputs": {
+      "clip_name": "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"
+    },
+    "class_type": "CLIPVisionLoader",
+    "_meta": {
+      "title": "Load CLIP Vision"
+    }
+  },
+  "32": {
+    "inputs": {
+      "preset": "PLUS (high strength)",
+      "model": [
+        "11",
+        1
+      ]
+    },
+    "class_type": "IPAdapterUnifiedLoader",
+    "_meta": {
+      "title": "IPAdapter Unified Loader"
+    }
+  },
+  "33": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "interpolation": "bicubic",
+      "method": "keep proportion",
+      "condition": "always",
+      "multiple_of": 0,
+      "image": [
+        "42",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "34": {
+    "inputs": {
+      "width": [
+        "35",
+        1
+      ],
+      "height": [
+        "35",
+        2
+      ],
+      "position": "center",
+      "x_offset": 0,
+      "y_offset": 0,
+      "image": [
+        "33",
+        0
+      ]
+    },
+    "class_type": "ImageCrop+",
+    "_meta": {
+      "title": "🔧 Image Crop"
+    }
+  },
+  "35": {
+    "inputs": {
+      "width": [
+        "33",
+        1
+      ],
+      "height": [
+        "33",
+        2
+      ],
+      "interpolation": "bicubic",
+      "method": "pad",
+      "condition": "always",
+      "multiple_of": 32,
+      "image": [
+        "33",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "36": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "interpolation": "bicubic",
+      "method": "keep proportion",
+      "condition": "always",
+      "multiple_of": 0,
+      "image": [
+        "43",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "38": {
+    "inputs": {
+      "width": [
+        "36",
+        1
+      ],
+      "height": [
+        "36",
+        2
+      ],
+      "interpolation": "bicubic",
+      "method": "pad",
+      "condition": "always",
+      "multiple_of": 32,
+      "image": [
+        "36",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "42": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)"
+    }
+  },
+  "43": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)"
+    }
+  },
+  "44": {
+    "inputs": {
+      "da_model": [
+        "45",
+        0
+      ],
+      "images": [
+        "35",
+        0
+      ]
+    },
+    "class_type": "DepthAnything_V2",
+    "_meta": {
+      "title": "Depth Anything V2"
+    }
+  },
+  "45": {
+    "inputs": {
+      "model": "depth_anything_v2_vitl_fp32.safetensors",
+      "precision": "auto"
+    },
+    "class_type": "DownloadAndLoadDepthAnythingV2Model",
+    "_meta": {
+      "title": "DownloadAndLoadDepthAnythingV2Model"
+    }
+  },
+  "53": {
+    "inputs": {
+      "model_name": "Qwen3VL-4B-Instruct-Q8_0.gguf",
+      "preset_prompt": "🖼️ Detailed Description",
+      "custom_prompt": "You are a professional image prompt engineer. You will receive exactly two images. Your task is to produce one single generation-ready paragraph — nothing else.\nCONTENT — extract exclusively from Image 1:\nEvery subject, object, and architectural form present. The exact building shapes, facades, structural elements, columns, windows, balconies, signage, and surface details. The camera angle, framing, and perspective. The spatial depth and layering of the scene. The street, ground surface, lane markings, sidewalk, and foliage. The background skyline and any receding elements. Every physical thing that exists in that image — preserved exactly as it is compositionally.\nSTYLE — extract exclusively from Image 2:\nThe time of day and sky condition. The quality, hardness, and direction of light. The color temperature of every surface. The entire color palette and dominant hues. The tonal range, contrast level, and color grading. The atmospheric clarity or haze. The texture rendering on all materials. The mood, emotional register, and photographic finish. The way shadows behave and where highlights land.\nCRITICAL OVERRIDE RULES — these cancel Image 1's style entirely:\n\nThe time of day in your output must match Image 2, not Image 1 — if Image 1 is night and Image 2 is day, your output is day. This is non-negotiable.\nThe lighting in your output must come from Image 2 — if Image 1 has warm orange artificial glow and Image 2 has cool diffused daylight, your output has cool diffused daylight. Erase Image 1's lighting completely.\nThe color palette in your output must match Image 2 — if Image 1 is deep indigo and amber and Image 2 is ivory and sage, your output is ivory and sage. No exceptions.\nLong exposure effects, light trails, wet reflections, neon glow, or any other atmospheric artifact from Image 1 must not appear unless Image 2 also contains them.\nDo not average or blend the two styles. The style split is total and absolute. Image 2 wins every time.\n\nOUTPUT RULES:\n\nWrite one paragraph only — dense, precise, vivid, spatially ordered from foreground to background\nNo introduction, no labels, no explanation, no headings, no commentary\nDo not reference the images, the process, or yourself\nDo not write more than one paragraph\nBegin the paragraph immediately and end it when the scene is fully described\n\nOutput the paragraph now. Nothing before it. Nothing after it.",
+      "max_tokens": 512,
+      "keep_model_loaded": true,
+      "seed": 78,
+      "image": [
+        "43",
+        0
+      ]
+    },
+    "class_type": "AILab_QwenVL_GGUF",
+    "_meta": {
+      "title": "QwenVL (GGUF)"
+    }
+  },
+  "55": {
+    "inputs": {
+      "text": [
+        "53",
+        0
+      ]
+    },
+    "class_type": "ShowText|pysssss",
+    "_meta": {
+      "title": "Show Text 🐍"
+    }
+  },
+  "119": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "120": {
+    "inputs": {
+      "width": [
+        "121",
+        0
+      ],
+      "height": [
+        "121",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": {
+      "title": "Empty Flux 2 Latent"
+    }
+  },
+  "121": {
+    "inputs": {
+      "image": [
+        "151",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "122": {
+    "inputs": {
+      "conditioning": [
+        "135",
+        0
+      ],
+      "latent": [
+        "123",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "123": {
+    "inputs": {
+      "pixels": [
+        "151",
+        0
+      ],
+      "vae": [
+        "125",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "124": {
+    "inputs": {
+      "conditioning": [
+        "155",
+        0
+      ],
+      "latent": [
+        "123",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "125": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "128": {
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "130": {
+    "inputs": {
+      "steps": 5,
+      "width": [
+        "121",
+        0
+      ],
+      "height": [
+        "121",
+        1
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "131": {
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "135": {
+    "inputs": {
+      "conditioning": [
+        "155",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    }
+  },
+  "136": {
+    "inputs": {
+      "noise": [
+        "139",
+        0
+      ],
+      "guider": [
+        "137",
+        0
+      ],
+      "sampler": [
+        "119",
+        0
+      ],
+      "sigmas": [
+        "130",
+        0
+      ],
+      "latent_image": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "137": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "156",
+        0
+      ],
+      "positive": [
+        "124",
+        0
+      ],
+      "negative": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFGGuider"
+    }
+  },
+  "139": {
+    "inputs": {
+      "noise_seed": 412497107469688
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "147": {
+    "inputs": {
+      "samples": [
+        "136",
+        0
+      ],
+      "vae": [
+        "125",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "149": {
+    "inputs": {
+      "method": "mkl",
+      "strength": 1,
+      "multithread": true,
+      "image_ref": [
+        "151",
+        0
+      ],
+      "image_target": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "ColorMatch",
+    "_meta": {
+      "title": "Color Match"
+    }
+  },
+  "151": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": 1,
+      "resolution_steps": 1,
+      "image": [
+        "182",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "153": {
+    "inputs": {
+      "filename_prefix": "klein_archenhanced_v10_",
+      "images": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "155": {
+    "inputs": {
+      "text": "archenhanced refine detail and realism while preserving the original composition, colors, lighting mood, and architectural identity",
+      "clip": [
+        "128",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "156": {
+    "inputs": {
+      "lora_name": "Klein_9B_bvfinish_v01.safetensors",
+      "strength_model": 0.9,
+      "model": [
+        "131",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "182": {
+    "inputs": {
+      "width": [
+        "33",
+        1
+      ],
+      "height": [
+        "33",
+        2
+      ],
+      "interpolation": "bicubic",
+      "method": "fill / crop",
+      "condition": "always",
+      "multiple_of": 0,
+      "image": [
+        "16",
+        7
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  }
+}

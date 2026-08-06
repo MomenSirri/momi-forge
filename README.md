@@ -98,6 +98,9 @@ Example:
 RUNPOD_API_KEY=your_runpod_api_key
 RUNPOD_POD_ID_SEED=your_serverless_endpoint_id
 RUNPOD_TARGET_ENV=SEED
+RUNPOD_MANAGEMENT_URL=/runpod-management
+RUNPOD_MANAGEMENT_DIST_DIR=D:\runpod_mangment\pythonProject\webapp\frontend\dist
+RUNPOD_MANAGEMENT_API_UPSTREAM_URL=https://127.0.0.1:8843
 USER_DB_PATH=users.db
 MOMI_WORKFLOW_FILE=Seedvr_flux_upscaler_03.json
 SAVE_DEBUG_PROMPT_JSON=0
@@ -107,6 +110,8 @@ SAVE_DEBUG_PROMPT_JSON=0
 
 - `RUNPOD_TARGET_ENV=SEED` means the app will use `RUNPOD_POD_ID_SEED`.
 - The RunPod ID here should be your **serverless endpoint ID**.
+- `RUNPOD_MANAGEMENT_URL` controls the admin/ex RunPod Management iframe inside Admin Analytics.
+- The default `/runpod-management` path serves RunPod Management through the Momi Forge port, so users do not need direct access to ports `5173` or `8843`.
 - `users.db` is created automatically if it does not exist.
 
 ## User management (company sign-in)
@@ -116,7 +121,7 @@ The app now supports internal BrickVisual sign-in and only accepts `@brickvisual
 User records are stored in `users.db` table `users` with:
 - `email`
 - `pwd_hash` (bcrypt)
-- `role` (`user` or `admin`)
+- `role` (`user`, `admin`, or `ex`)
 - `is_active` (1/0)
 
 Use the built-in admin CLI:
@@ -139,10 +144,11 @@ It will prompt securely for password and confirmation.
 python manage_users.py set-password --email john.smith@brickvisual.com
 ```
 
-### 3) Grant/remove admin role
+### 3) Change permission role
 
 ```powershell
 python manage_users.py set-role --email john.smith@brickvisual.com --role admin
+python manage_users.py set-role --email john.smith@brickvisual.com --role ex
 python manage_users.py set-role --email john.smith@brickvisual.com --role user
 ```
 
@@ -160,6 +166,7 @@ python manage_users.py show --email john.smith@brickvisual.com
 python manage_users.py list
 python manage_users.py list --active-only
 python manage_users.py list --role admin
+python manage_users.py list --role ex
 ```
 
 ### 6) Avatar mapping

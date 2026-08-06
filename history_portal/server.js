@@ -1070,7 +1070,9 @@ async function getIdentityForEmail(email) {
     email: normalizeEmail(row.email),
     prefix,
     displayName,
-    role: String(row.role || 'user').toLowerCase() === 'admin' ? 'admin' : 'user',
+    role: ['user', 'admin', 'ex'].includes(String(row.role || 'user').toLowerCase())
+      ? String(row.role || 'user').toLowerCase()
+      : 'user',
     avatarFilename,
     avatarUrl: `/avatars/${encodeURIComponent(avatarFilename)}`,
     isActive: Number(row.is_active || 0) === 1,

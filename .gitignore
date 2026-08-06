@@ -16,6 +16,19 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+
+# Runtime-generated history and user media
+image_load_card/
+thumbnails/
+trace_logs/
+bricker_image/
+
+# Local TLS certificates and private keys
+openssl/
+*.pfx
+momi_cert.zip
 
 # Logs
 *.log
@@ -41,4 +54,5 @@ updated_prompt_*.json
 # Build artifacts
 build/
 dist/
+node_modules/
 *.egg-info/

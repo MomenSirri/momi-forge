@@ -20,6 +20,7 @@ load_dotenv()
 
 RUNPOD_GET_RETRIES = int(os.getenv("RUNPOD_GET_RETRIES", "5"))
 RUNPOD_RETRY_BACKOFF_S = float(os.getenv("RUNPOD_RETRY_BACKOFF_S", "1.0"))
+RUNPOD_ERROR_BODY_MAX_CHARS = int(os.getenv("RUNPOD_ERROR_BODY_MAX_CHARS", "1200"))
 
 
 class RunpodAPI:
@@ -62,6 +63,18 @@ class RunpodAPI:
             RUNPOD_GET_RETRIES if method.upper() == "GET" else 1
         )
 
+        def _format_http_error(response: requests.Response) -> str:
+            body = (response.text or "").strip()
+            if len(body) > RUNPOD_ERROR_BODY_MAX_CHARS:
+                body = f"{body[:RUNPOD_ERROR_BODY_MAX_CHARS]}..."
+
+            message = (
+                f"{response.status_code} {response.reason} for {method.upper()} {url}"
+            )
+            if body:
+                message += f"\nRunPod response: {body}"
+            return message
+
         def _do_request() -> dict[str, Any]:
             last_error: Exception | None = None
 
@@ -74,7 +87,8 @@ class RunpodAPI:
                         json=json_body,
                         timeout=timeout,
                     )
-                    response.raise_for_status()
+                    if not response.ok:
+                        raise RuntimeError(_format_http_error(response))
                     return response.json()
                 except (
                     SSLError,
@@ -120,9 +134,19 @@ class RunpodAPI:
     async def cancel(self, job_id: str) -> dict[str, Any]:
         return await self._request_json("POST", f"/cancel/{job_id}", timeout=30)
 
-    async def check_health(self) -> dict[str, Any]:
+    async def check_health(
+        self,
+        *,
+        timeout: int = 6,
+        retries: int = 1,
+    ) -> dict[str, Any]:
         try:
-            result = await self._request_json("GET", "/health", timeout=15)
+            result = await self._request_json(
+                "GET",
+                "/health",
+                timeout=timeout,
+                retries=retries,
+            )
             workers = result.get("workers", {}) or {}
             jobs = result.get("jobs", {}) or {}
             return {

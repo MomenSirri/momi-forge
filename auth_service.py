@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 COMPANY_DOMAIN = os.getenv("COMPANY_EMAIL_DOMAIN", "brickvisual.com").strip().lower()
+VALID_ROLES = {"user", "admin", "ex"}
 
 
 def normalize_email(value: str | None) -> str:
@@ -150,7 +151,7 @@ class BrickAuthService:
         normalized = normalize_email(email)
         if db_role:
             role = db_role.strip().lower()
-            if role in {"admin", "user"}:
+            if role in VALID_ROLES:
                 return role
         if normalized in self.admin_emails:
             return "admin"

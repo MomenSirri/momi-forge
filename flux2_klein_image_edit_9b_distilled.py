@@ -1,0 +1,1125 @@
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import os
+import random
+import re
+import tempfile
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("RUNPOD_POD_ID_FLUX2_KLEIN", "usdkzwazqh749m")
+
+import gradio as gr
+from PIL import Image
+from gradio_imageslider import ImageSlider
+
+from auth_service import get_auth_service
+from runpod_api_class import RunpodAPI
+from task_tracking import TaskTracker, WorkflowContext, extract_artifacts_from_status
+from utils import (
+    _decode_output_image,
+    _extract_error_message,
+    _extract_progress_signal,
+    _has_final_output_payload,
+    _to_pil_image,
+    prepare_json,
+    save_input_image_as_base64,
+)
+
+_app_log_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _app_log_level, logging.INFO))
+logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("gradio").setLevel(logging.WARNING)
+
+APP_TITLE = "Momi Forge"
+WORKFLOW_NAME = os.getenv(
+    "FLUX2_KLEIN_WORKFLOW_NAME",
+    "flux2_klein_image_edit_9b_distilled_02",
+)
+WORKFLOW_FILE = os.getenv(
+    "FLUX2_KLEIN_WORKFLOW_FILE",
+    f"{WORKFLOW_NAME}.json",
+)
+WORKFLOW_VERSION = os.getenv("WORKFLOW_VERSION_FLUX2_KLEIN", "distilled")
+WORKFLOW_CATEGORY = os.getenv("WORKFLOW_CATEGORY_FLUX2_KLEIN", "image_edit")
+WORKFLOW_TYPE = os.getenv("WORKFLOW_TYPE_FLUX2_KLEIN", "image")
+RUNPOD_ENVIRONMENT = os.getenv("FLUX2_KLEIN_RUNPOD_ENVIRONMENT", "flux2_klein")
+APP_ENVIRONMENT = os.getenv("FLUX2_KLEIN_APP_ENVIRONMENT", RUNPOD_ENVIRONMENT)
+APP_DEBUG = os.getenv("APP_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+APP_QUIET = os.getenv("APP_QUIET", "1").strip().lower() in {"1", "true", "yes", "on"}
+RUNPOD_STATUS_POLL_INTERVAL_S = max(
+    0.1,
+    float(os.getenv("RUNPOD_STATUS_POLL_INTERVAL_S", "0.4")),
+)
+MAX_STATUS_POLLS = int(os.getenv("RUNPOD_MAX_STATUS_POLLS", "1800"))
+WORKFLOW_DEBUG_JSON_DIR = Path(
+    os.getenv(
+        "WORKFLOW_DEBUG_JSON_DIR",
+        str(Path(__file__).resolve().parent / "trace_logs" / "workflow_debug"),
+    )
+)
+
+TERMINAL_FAILURES = {"FAILED", "ERROR", "TIMED_OUT", "CANCELLED"}
+MODE_EDIT = "Edit"
+MODE_REFERENCE_TRANSFER = "Reference Transfer"
+MODE_CONSISTENCY = "Consistency"
+MODE_RAW_ENHANCEMENT = "Raw Enhancement"
+MODE_CHOICES = [
+    MODE_EDIT,
+    MODE_REFERENCE_TRANSFER,
+    MODE_CONSISTENCY,
+    MODE_RAW_ENHANCEMENT,
+]
+IMAGE_COUNT_CHOICES = ["1", "2", "3"]
+MODE_TO_FIXED_IMAGE_COUNT = {
+    MODE_REFERENCE_TRANSFER: 2,
+    MODE_CONSISTENCY: 1,
+    MODE_RAW_ENHANCEMENT: 1,
+}
+MODE_TO_LORA = {
+    MODE_REFERENCE_TRANSFER: "Klein_ref_transfer_02.safetensors",
+    MODE_CONSISTENCY: "Klein-consistency.safetensors",
+    MODE_RAW_ENHANCEMENT: "Klein_9B_bvfinish_v01.safetensors",
+}
+
+NODE_IMAGE_1 = "76"
+NODE_IMAGE_2 = "121"
+NODE_IMAGE_3 = "165"
+NODE_CFG_GUIDER = "145"
+NODE_POSITIVE_1 = "150"
+NODE_NEGATIVE_1 = "148"
+NODE_POSITIVE_2 = "159"
+NODE_NEGATIVE_2 = "157"
+NODE_POSITIVE_3 = "164"
+NODE_NEGATIVE_3 = "162"
+NODE_BASE_MODEL = "142"
+NODE_POSITIVE_TEXT = "154"
+NODE_NEGATIVE_TEXT = "161"
+NODE_LORA = "167"
+NODE_QWEN = "168"
+NODE_STRING_FUNCTION = "169"
+NODE_NOISE = "141"
+NODE_MAIN_IMAGE_SCALE = "151"
+NODE_REFERENCE_IMAGE_SCALE = "160"
+NODE_THIRD_IMAGE_SCALE = "166"
+NODE_PADDED_IMAGE_1 = "174"
+NODE_PADDED_IMAGE_2 = "178"
+NODE_PADDED_IMAGE_3 = "180"
+NODE_FINAL_CROP = "182"
+NODE_SAVE_IMAGE = "137"
+NODE_VAE_DECODE = "140"
+
+SAMPLER_PROGRESS_PATTERN = re.compile(r"node=(?P<node>[^ ]+)\s+(?P<done>\d+)/(?P<total>\d+)")
+FRACTION_PATTERN = re.compile(r"(?P<done>\d+)/(?P<total>\d+)")
+RUNNING_NODE_PATTERN = re.compile(r"Running node (?P<node>\d+(?::\d+)?):\s*(?P<label>.+)$")
+
+REFERENCE_TRANSFER_QWEN_PROMPT = """Your task is to describe the image in three parts:
+
+Mood: one word (e.g., sunset, night, overcast, rainy)
+
+Sky: two words
+
+Lighting: two words
+
+Format: mood, sky sky, light light
+
+Example: sunset, clear desaturated, golden soft"""
+
+RAW_ENHANCEMENT_QWEN_PROMPT = """You are generating captions for training a LoRA that enhances raw architectural renders into high-quality, photorealistic architectural visualizations.
+
+Your task is to describe the final enhanced image as a polished architectural result, not the editing process.
+
+Instructions:
+
+1. Describe the architectural scene clearly and concisely:
+   - building type, such as modern villa, apartment complex, office interior
+   - view type, such as exterior, interior, aerial, street-level, courtyard, lobby
+   - key materials, such as concrete, glass, wood, stone
+   - environment, such as landscaped garden, urban street, vegetation, furniture
+   - lighting and time of day, such as soft daylight, overcast, dusk, warm interior lighting
+   - sky color, such as blue sky, white sky, black starless sky
+
+2. Always describe the image as a high-quality final architectural visualization, using consistent phrases such as:
+   - polished architectural visualization
+   - photoreal finish
+   - natural color grading
+   - realistic materials
+   - believable lighting
+   - refined vegetation
+   - premium archviz quality
+
+3. Do not describe editing actions or software processes.
+   Avoid phrases like:
+   - photoshop enhanced
+   - increased contrast
+   - boosted vibrance
+   - color corrected
+
+4. Do not mention that the image was previously raw or unfinished.
+
+5. Keep the caption as a single comma-separated sentence.
+
+6. Keep the length moderate, around 12–20 words.
+
+7. Maintain consistent wording across captions for the final-look qualities, while varying the scene description.
+
+8. Always include the trigger token at the beginning:
+
+bvfinish
+
+Output format:
+
+Return only the caption. Do not include explanations.
+
+Example outputs:
+
+bvfinish, modern villa exterior, concrete and wood facade, landscaped garden, soft daylight, polished architectural visualization, photoreal finish, natural color grading, realistic materials, believable lighting
+
+bvfinish, office lobby interior, stone flooring, wood wall panels, reception desk, warm indirect lighting, premium architectural visualization, realistic materials, natural color grading, refined lighting
+
+bvfinish, residential apartment courtyard, balconies, vegetation, pedestrian path, overcast daylight, polished archviz render, photoreal finish, balanced color, realistic foliage"""
+
+MODE_HINTS = {
+    MODE_EDIT: """**Edit Mode**
+
+Edit Mode is the general-purpose mode for adding, removing, or changing elements. It can work with up to three inputs. It is ideal for tasks such as adding or replacing people, adding accessories, changing the mood, or changing the style.
+
+Use natural instruction language and keep negative prompts to a minimum.""",
+    MODE_REFERENCE_TRANSFER: """**Reference Transfer**
+
+Add your main image in the first image slot and your reference image in the second image slot. No prompt is needed in this mode.""",
+    MODE_CONSISTENCY: """**Consistency**
+
+This is an edit mode that works with only one image and keeps the result highly consistent with the original.
+
+It is best used when you want to make controlled changes without strongly altering the image structure.
+
+It usually works well for simple improvements such as color, lighting, adding details, removing small elements, and style adjustments.""",
+    MODE_RAW_ENHANCEMENT: """**Raw Enhancement**
+
+This mode helps improve your raw render in terms of color and detail. It aims to make the image as realistic as possible.""",
+}
+
+BOTTOM_PROGRESS_LAYOUT_CSS = """
+.bottom-progress-row {
+  margin-top: 12px;
+  margin-bottom: 12px;
+}
+
+.bottom-progress-row > div {
+  width: 100%;
+}
+"""
+
+auth_service = get_auth_service()
+
+
+def _request_header(request: gr.Request, key: str) -> str | None:
+    headers = getattr(request, "headers", None) or {}
+    return headers.get(key) or headers.get(key.lower()) or headers.get(key.title())
+
+
+def _is_admin_identity(email: str | None) -> bool:
+    normalized_email = (email or "").strip()
+    if not normalized_email:
+        return False
+    identity = auth_service.get_identity(normalized_email)
+    return str(getattr(identity, "role", "") or "").strip().lower() == "admin"
+
+
+def _debug_checkbox_visibility_update(request: gr.Request):
+    return gr.update(
+        visible=_is_admin_identity(getattr(request, "username", None)),
+        value=False,
+    )
+
+
+def _save_workflow_debug_json(
+    payload: dict[str, Any],
+    *,
+    workflow_name: str,
+    task_id: str,
+) -> Path:
+    workflow_payload: Any = payload
+    if isinstance(payload, dict):
+        input_payload = payload.get("input")
+        if isinstance(input_payload, dict) and isinstance(input_payload.get("workflow"), dict):
+            workflow_payload = input_payload["workflow"]
+
+    WORKFLOW_DEBUG_JSON_DIR.mkdir(parents=True, exist_ok=True)
+    safe_workflow = re.sub(r"[^a-zA-Z0-9_-]+", "_", workflow_name).strip("_") or "workflow"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_path = WORKFLOW_DEBUG_JSON_DIR / f"flux2_klein_{safe_workflow}_{task_id}_{timestamp}.json"
+    with open(debug_path, "w", encoding="utf-8") as outfile:
+        json.dump(workflow_payload, outfile, indent=2)
+    return debug_path
+
+
+def _resolve_flux2_klein_workflow_path(workflow: str | None = None) -> Path:
+    del workflow
+    configured_path = os.getenv("FLUX2_KLEIN_WORKFLOW_PATH", "").strip()
+    if configured_path:
+        path = Path(configured_path)
+        if path.exists():
+            return path
+
+    workflow_file = WORKFLOW_FILE
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        script_dir / "api_workflow" / workflow_file,
+        script_dir / "api_workflow" / "New_runpod" / workflow_file,
+        script_dir.parent / "api_workflow" / workflow_file,
+        script_dir.parent / "api_workflow" / "New_runpod" / workflow_file,
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        f"Could not find workflow file '{workflow_file}' in the expected api_workflow folders."
+    )
+
+
+def _render_status_panel(
+    title: str,
+    message: str,
+    *,
+    percent: int | None = None,
+    accent: str = "#38bdf8",
+) -> str:
+    safe_title = html.escape(title)
+    safe_message = html.escape(message).replace("\n", "<br>")
+    progress_html = ""
+    if percent is not None:
+        clamped = max(0, min(int(percent), 100))
+        progress_html = f"""
+  <div style="margin-top:10px;height:10px;background:#1e293b;border-radius:999px;overflow:hidden;">
+    <div style="height:10px;width:{clamped}%;background:linear-gradient(90deg,{accent},#3b82f6);"></div>
+  </div>
+  <div style="margin-top:8px;font-size:12px;opacity:.8;">{clamped}%</div>
+"""
+    return f"""
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:14px;padding:14px 16px;color:#e2e8f0;font-family:'Segoe UI',Arial,sans-serif;">
+  <div style="font-weight:700;font-size:15px;color:{accent};">{safe_title}</div>
+  <div style="margin-top:8px;font-size:13px;line-height:1.45;">{safe_message}</div>
+  {progress_html}
+</div>
+"""
+
+
+def _render_idle_status() -> str:
+    return _render_status_panel(
+        "Ready",
+        "Choose a mode, upload the required image inputs, and run the workflow.",
+        percent=0,
+    )
+
+
+def _describe_progress_status(
+    state: str,
+    progress_text: str | None,
+    *,
+    has_final_output: bool,
+    runpod_progress: int | float | None = None,
+) -> tuple[str, str, int]:
+    normalized_state = (state or "IN_PROGRESS").upper()
+    percent = 5 if normalized_state == "IN_QUEUE" else 12
+    if normalized_state == "IN_QUEUE":
+        title = "Preparing image"
+        message = "Preparing image"
+    else:
+        title = "Sampling / generating image"
+        message = "Sampling / generating image"
+    text = (progress_text or "").strip()
+
+    if text:
+        sampler_match = SAMPLER_PROGRESS_PATTERN.search(text)
+        if sampler_match:
+            done = int(sampler_match.group("done"))
+            total = max(int(sampler_match.group("total")), 1)
+            percent = max(percent, min(92, int(round(20 + (done / total) * 65))))
+            title = "Sampling / generating image"
+            message = "Sampling / generating image"
+        else:
+            fraction_match = FRACTION_PATTERN.search(text)
+            if fraction_match and normalized_state != "IN_QUEUE":
+                done = int(fraction_match.group("done"))
+                total = max(int(fraction_match.group("total")), 1)
+                percent = max(percent, min(90, int(round(18 + (done / total) * 62))))
+                title = "Sampling / generating image"
+                message = "Sampling / generating image"
+
+        running_match = RUNNING_NODE_PATTERN.match(text)
+        if running_match:
+            percent = max(percent, 18)
+        elif "execution finished" in text.lower():
+            title = "Image generated"
+            message = "Image generated"
+            percent = max(percent, 94)
+        elif (
+            "fetching execution history" in text.lower()
+            or "collecting image" in text.lower()
+            or "collecting output" in text.lower()
+        ):
+            title = "Saving output"
+            message = "Saving output"
+            percent = max(percent, 95)
+        elif "job completed. returning" in text.lower():
+            title = "Saving output"
+            message = "Saving output"
+            percent = max(percent, 96)
+
+    if isinstance(runpod_progress, (int, float)):
+        percent = max(percent, max(0, min(int(float(runpod_progress)), 100)))
+
+    if has_final_output:
+        title = "Saving output"
+        message = "Saving output"
+        percent = max(percent, 96)
+
+    return title, message, percent
+
+
+def _render_progress_status(
+    state: str,
+    progress_text: str | None,
+    *,
+    has_final_output: bool,
+    runpod_progress: int | float | None = None,
+) -> str:
+    title, message, percent = _describe_progress_status(
+        state,
+        progress_text,
+        has_final_output=has_final_output,
+        runpod_progress=runpod_progress,
+    )
+    return _render_status_panel(title, message, percent=percent)
+
+
+def _processing_stage_name(state: str, *, has_final_output: bool) -> str:
+    normalized_state = (state or "").upper()
+    if has_final_output:
+        return "wrap_up"
+    if normalized_state == "IN_QUEUE":
+        return "queued"
+    if normalized_state in {"IN_PROGRESS", "RUNNING"}:
+        return "processing"
+    return normalized_state.lower() or "processing"
+
+
+def _disable_generate_button() -> dict[str, Any]:
+    return gr.update(interactive=False)
+
+
+def _enable_generate_button() -> dict[str, Any]:
+    return gr.update(interactive=True)
+
+
+def _connect(
+    prompt: dict[str, Any],
+    target_node: str,
+    input_name: str,
+    source_node: str,
+    output_idx: int = 0,
+) -> None:
+    prompt[target_node]["inputs"][input_name] = [source_node, output_idx]
+
+
+def _effective_image_count(mode: str, image_count: str | int | None) -> int:
+    if mode in MODE_TO_FIXED_IMAGE_COUNT:
+        return MODE_TO_FIXED_IMAGE_COUNT[mode]
+    try:
+        count = int(image_count or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, min(count, 3))
+
+
+def _apply_conditioning_routing(prompt: dict[str, Any], image_count: int) -> None:
+    if image_count <= 1:
+        _connect(prompt, NODE_CFG_GUIDER, "positive", NODE_POSITIVE_1)
+        _connect(prompt, NODE_CFG_GUIDER, "negative", NODE_NEGATIVE_1)
+        return
+
+    if image_count == 2:
+        _connect(prompt, NODE_CFG_GUIDER, "positive", NODE_POSITIVE_2)
+        _connect(prompt, NODE_CFG_GUIDER, "negative", NODE_NEGATIVE_2)
+        _connect(prompt, NODE_POSITIVE_2, "conditioning", NODE_POSITIVE_1)
+        _connect(prompt, NODE_NEGATIVE_2, "conditioning", NODE_NEGATIVE_1)
+        return
+
+    _connect(prompt, NODE_CFG_GUIDER, "positive", NODE_POSITIVE_3)
+    _connect(prompt, NODE_CFG_GUIDER, "negative", NODE_NEGATIVE_3)
+    _connect(prompt, NODE_POSITIVE_2, "conditioning", NODE_POSITIVE_1)
+    _connect(prompt, NODE_NEGATIVE_2, "conditioning", NODE_NEGATIVE_1)
+    _connect(prompt, NODE_POSITIVE_3, "conditioning", NODE_POSITIVE_2)
+    _connect(prompt, NODE_NEGATIVE_3, "conditioning", NODE_NEGATIVE_2)
+
+
+def _apply_mode_routing(prompt: dict[str, Any], *, mode: str, prompt_text: str) -> None:
+    cleaned_prompt = str(prompt_text or "").strip()
+    prompt[NODE_NEGATIVE_TEXT]["inputs"]["text"] = ""
+    _connect(prompt, NODE_QWEN, "image", NODE_MAIN_IMAGE_SCALE)
+
+    if mode == MODE_EDIT:
+        _connect(prompt, NODE_CFG_GUIDER, "model", NODE_BASE_MODEL)
+        prompt[NODE_POSITIVE_TEXT]["inputs"]["text"] = cleaned_prompt
+        return
+
+    prompt[NODE_LORA]["inputs"]["lora_name"] = MODE_TO_LORA[mode]
+    _connect(prompt, NODE_CFG_GUIDER, "model", NODE_LORA)
+
+    if mode == MODE_REFERENCE_TRANSFER:
+        _connect(prompt, NODE_QWEN, "image", NODE_REFERENCE_IMAGE_SCALE)
+        prompt[NODE_QWEN]["inputs"]["custom_prompt"] = REFERENCE_TRANSFER_QWEN_PROMPT
+        prompt[NODE_STRING_FUNCTION]["inputs"]["text_a"] = "Change the mood and lighting of Image 1 to "
+        prompt[NODE_STRING_FUNCTION]["inputs"]["text_b"] = [NODE_QWEN, 0]
+        prompt[NODE_STRING_FUNCTION]["inputs"]["text_c"] = (
+            " to match Image 2, specifically the light direction, shadows, and contrast, "
+            "while keeping all details in Image 1 exactly the same."
+        )
+        prompt[NODE_POSITIVE_TEXT]["inputs"]["text"] = [NODE_STRING_FUNCTION, 0]
+        return
+
+    if mode == MODE_CONSISTENCY:
+        prompt[NODE_QWEN]["inputs"]["custom_prompt"] = ""
+        prompt[NODE_POSITIVE_TEXT]["inputs"]["text"] = cleaned_prompt
+        return
+
+    prompt[NODE_QWEN]["inputs"]["custom_prompt"] = RAW_ENHANCEMENT_QWEN_PROMPT
+    prompt[NODE_POSITIVE_TEXT]["inputs"]["text"] = [NODE_QWEN, 0]
+
+
+def _has_workflow_node(prompt: dict[str, Any], node_id: str) -> bool:
+    return isinstance(prompt.get(node_id), dict) and isinstance(prompt[node_id].get("inputs"), dict)
+
+
+def _set_node_input_if_present(
+    prompt: dict[str, Any],
+    node_id: str,
+    input_name: str,
+    value: Any,
+) -> None:
+    if _has_workflow_node(prompt, node_id):
+        prompt[node_id]["inputs"][input_name] = value
+
+
+def _has_padding_crop_nodes(prompt: dict[str, Any]) -> bool:
+    required_nodes = {
+        "147",
+        "170",
+        "177",
+        "179",
+        "181",
+        NODE_PADDED_IMAGE_1,
+        NODE_PADDED_IMAGE_2,
+        NODE_PADDED_IMAGE_3,
+        NODE_FINAL_CROP,
+    }
+    return all(_has_workflow_node(prompt, node_id) for node_id in required_nodes)
+
+
+def _apply_padding_crop_routing(prompt: dict[str, Any], *, mode: str, image_count: int) -> None:
+    _connect(prompt, NODE_MAIN_IMAGE_SCALE, "image", NODE_IMAGE_1)
+    _connect(prompt, "170", "image", NODE_MAIN_IMAGE_SCALE)
+    _connect(prompt, NODE_PADDED_IMAGE_1, "image", NODE_IMAGE_1)
+    _connect(prompt, "147", "image", NODE_PADDED_IMAGE_1)
+    _connect(prompt, "149", "pixels", NODE_PADDED_IMAGE_1)
+
+    if image_count >= 2:
+        _connect(prompt, NODE_REFERENCE_IMAGE_SCALE, "image", NODE_IMAGE_2)
+        _connect(prompt, "177", "image", NODE_REFERENCE_IMAGE_SCALE)
+        _connect(prompt, NODE_PADDED_IMAGE_2, "image", NODE_IMAGE_2)
+        _connect(prompt, "158", "pixels", NODE_PADDED_IMAGE_2)
+    if image_count >= 3:
+        _connect(prompt, NODE_THIRD_IMAGE_SCALE, "image", NODE_IMAGE_3)
+        _connect(prompt, "179", "image", NODE_THIRD_IMAGE_SCALE)
+        _connect(prompt, NODE_PADDED_IMAGE_3, "image", NODE_IMAGE_3)
+        _connect(prompt, "163", "pixels", NODE_PADDED_IMAGE_3)
+
+    if mode == MODE_REFERENCE_TRANSFER and image_count >= 2:
+        _connect(prompt, NODE_QWEN, "image", NODE_PADDED_IMAGE_2)
+    else:
+        _connect(prompt, NODE_QWEN, "image", NODE_PADDED_IMAGE_1)
+
+    if _has_workflow_node(prompt, "181"):
+        _connect(prompt, "181", "image", NODE_IMAGE_1)
+    if _has_workflow_node(prompt, NODE_FINAL_CROP):
+        _connect(prompt, NODE_FINAL_CROP, "image", NODE_VAE_DECODE)
+        _set_node_input_if_present(prompt, NODE_FINAL_CROP, "multiple_of", 1)
+    if _has_workflow_node(prompt, NODE_SAVE_IMAGE):
+        _connect(prompt, NODE_SAVE_IMAGE, "images", NODE_FINAL_CROP)
+
+
+def _apply_flux2_klein_workflow_updates(
+    prompt: dict[str, Any],
+    *,
+    mode: str,
+    image_count: int,
+    prompt_text: str,
+    image_names: list[str],
+    workflow: str | None = None,
+) -> None:
+    prompt[NODE_IMAGE_1]["inputs"]["image"] = image_names[0]
+    if len(image_names) > 1:
+        prompt[NODE_IMAGE_2]["inputs"]["image"] = image_names[1]
+    if len(image_names) > 2:
+        prompt[NODE_IMAGE_3]["inputs"]["image"] = image_names[2]
+
+    prompt[NODE_NOISE]["inputs"]["noise_seed"] = random.randint(0, 999_999_999_999)
+    _apply_conditioning_routing(prompt, image_count)
+    _apply_mode_routing(prompt, mode=mode, prompt_text=prompt_text)
+    if _has_padding_crop_nodes(prompt):
+        _apply_padding_crop_routing(prompt, mode=mode, image_count=image_count)
+
+
+def _crop_to_dimensions(image: Image.Image, width: int, height: int) -> Image.Image:
+    target_width = max(1, int(width))
+    target_height = max(1, int(height))
+    if image.width == target_width and image.height == target_height:
+        return image
+
+    if image.width < target_width or image.height < target_height:
+        canvas = Image.new(image.mode, (target_width, target_height))
+        offset_x = max((target_width - image.width) // 2, 0)
+        offset_y = max((target_height - image.height) // 2, 0)
+        canvas.paste(image, (offset_x, offset_y))
+        return canvas
+
+    left = max((image.width - target_width) // 2, 0)
+    top = max((image.height - target_height) // 2, 0)
+    return image.crop((left, top, left + target_width, top + target_height))
+
+
+def _save_temp_image(image: Image.Image, *, prefix: str) -> Path:
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_-]+", "_", prefix).strip("_") or "image"
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{safe_prefix}_",
+        suffix=".png",
+        delete=False,
+    ) as tmp:
+        image.save(tmp.name, format="PNG")
+        return Path(tmp.name)
+
+
+def _validate_mode_inputs(
+    *,
+    mode: str,
+    image_count: int,
+    image_1: Any,
+    image_2: Any,
+    image_3: Any,
+) -> None:
+    if image_1 is None:
+        raise ValueError("Image 1 is required.")
+    if image_count >= 2 and image_2 is None:
+        if mode == MODE_REFERENCE_TRANSFER:
+            raise ValueError("Reference Transfer mode requires two image inputs.")
+        raise ValueError("Image 2 is required for the selected Edit image count.")
+    if image_count >= 3 and image_3 is None:
+        raise ValueError("Image 3 is required for the selected Edit image count.")
+
+
+def _mode_controls_update(mode: str, image_count: str | int | None):
+    effective_count = _effective_image_count(mode, image_count)
+    return (
+        gr.update(visible=mode == MODE_EDIT, value=str(effective_count)),
+        gr.update(visible=mode != MODE_REFERENCE_TRANSFER),
+        gr.update(visible=True),
+        gr.update(visible=effective_count >= 2),
+        gr.update(visible=effective_count >= 3),
+        MODE_HINTS.get(mode, MODE_HINTS[MODE_EDIT]),
+    )
+
+
+def _edit_count_update(mode: str, image_count: str | int | None):
+    effective_count = _effective_image_count(mode, image_count)
+    return (
+        gr.update(visible=True),
+        gr.update(visible=effective_count >= 2),
+        gr.update(visible=effective_count >= 3),
+    )
+
+
+async def flux2_klein_generate(
+    mode: str,
+    edit_image_count: str,
+    image_1: Any,
+    image_2: Any,
+    image_3: Any,
+    prompt_text: str,
+    workflow_debug: bool,
+    job_state: str | None,
+    workflow: str,
+    request: gr.Request,
+):
+    del job_state
+    logger.info("Workflow %s called in mode %s", workflow, mode)
+
+    user_email = getattr(request, "username", None)
+    if not user_email:
+        yield (
+            gr.update(),
+            _render_status_panel(
+                "Authentication Required",
+                "Please sign in again before running the workflow.",
+                accent="#f87171",
+            ),
+            None,
+        )
+        return
+
+    identity = auth_service.get_identity(user_email)
+    user_role = str(getattr(identity, "role", "") or "").strip().lower()
+    is_admin_user = user_role == "admin"
+    user_agent = _request_header(request, "user-agent")
+    session_id = auth_service.session_key(identity.email, user_agent)
+    workflow_key = str(workflow or WORKFLOW_NAME)
+    source_page = "/tab/flux2-klein-image-edit-9b-distilled"
+    image_count = _effective_image_count(mode, edit_image_count)
+
+    try:
+        _validate_mode_inputs(
+            mode=mode,
+            image_count=image_count,
+            image_1=image_1,
+            image_2=image_2,
+            image_3=image_3,
+        )
+    except Exception as err:
+        yield gr.update(), _render_status_panel("Input Error", str(err), accent="#f87171"), None
+        return
+
+    try:
+        prompt_path = _resolve_flux2_klein_workflow_path(workflow_key)
+        with open(prompt_path, "r", encoding="utf-8") as fh:
+            prompt: dict[str, Any] = json.load(fh)
+    except UnicodeDecodeError:
+        with open(prompt_path, "r", encoding="cp1252") as fh:
+            prompt = json.load(fh)
+    except Exception as err:
+        yield gr.update(), _render_status_panel("Workflow Error", f"Prompt load failed: {err}", accent="#f87171"), None
+        return
+    uses_padding_crop = _has_padding_crop_nodes(prompt)
+
+    selected_images = [image_1]
+    if image_count >= 2:
+        selected_images.append(image_2)
+    if image_count >= 3:
+        selected_images.append(image_3)
+
+    try:
+        pil_images = []
+        for image in selected_images:
+            pil_image = _to_pil_image(image)
+            if pil_image.mode not in ("RGB", "RGBA"):
+                pil_image = pil_image.convert("RGB")
+            pil_images.append(pil_image)
+    except Exception as err:
+        yield gr.update(), _render_status_panel("Input Error", f"Image preparation failed: {err}", accent="#f87171"), None
+        return
+
+    input_paths = [_save_temp_image(image, prefix=f"flux2_input_{idx + 1}") for idx, image in enumerate(pil_images)]
+    image_names: list[str] = []
+    image_payload: list[dict[str, Any]] = []
+    for idx, pil_image in enumerate(pil_images, start=1):
+        image_name = f"flux2_klein_input_{idx}.jpg"
+        image_names.append(image_name)
+        image_payload.append({"name": image_name, "image": save_input_image_as_base64(pil_image)})
+
+    feature_flags = {
+        "mode": mode,
+        "image_count": image_count,
+        "uses_qwenvl": mode in {MODE_REFERENCE_TRANSFER, MODE_RAW_ENHANCEMENT},
+        "padding_crop": uses_padding_crop,
+        "padding_multiple": 32 if uses_padding_crop else None,
+    }
+    settings_snapshot = {
+        "mode": mode,
+        "image_count": image_count,
+        "prompt_text": str(prompt_text or ""),
+    }
+    task_id = str(uuid.uuid4())
+    workflow_context = WorkflowContext(
+        key=workflow_key,
+        name=workflow_key,
+        version=WORKFLOW_VERSION,
+        category=WORKFLOW_CATEGORY,
+        workflow_type=WORKFLOW_TYPE,
+    )
+    tracker = TaskTracker(
+        store=None,
+        task_id=task_id,
+        user_email=identity.email,
+        user_prefix=identity.username_prefix,
+        user_display_name=identity.display_name,
+        user_role=identity.role,
+        avatar_filename=identity.avatar_filename,
+        workflow=workflow_context,
+        source_page=source_page,
+        browser_user_agent=user_agent,
+        session_id=session_id,
+        environment_name=APP_ENVIRONMENT,
+        feature_flags=feature_flags,
+        settings=settings_snapshot,
+        input_meta={
+            "width": int(pil_images[0].width),
+            "height": int(pil_images[0].height),
+            "resolution": f"{int(pil_images[0].width)}x{int(pil_images[0].height)}",
+            "format": str(pil_images[0].mode),
+            "image_count": image_count,
+        },
+        request_summary={
+            "mode": mode,
+            "image_count": image_count,
+            "prompt_text": str(prompt_text or ""),
+        },
+        prompt_type="image_edit",
+        created_by=identity.email,
+    )
+
+    try:
+        _apply_flux2_klein_workflow_updates(
+            prompt,
+            mode=mode,
+            image_count=image_count,
+            prompt_text=prompt_text,
+            image_names=image_names,
+            workflow=workflow_key,
+        )
+    except KeyError as err:
+        tracker.fail(
+            failure_reason="workflow_key_missing",
+            error_message=str(err),
+            failure_stage="preparation",
+            progress_percent=0,
+            worker_id=None,
+        )
+        yield gr.update(), _render_status_panel("Workflow Error", f"Workflow key missing: {err}", accent="#f87171"), None
+        return
+    except Exception as err:
+        tracker.fail(
+            failure_reason="workflow_update_error",
+            error_message=str(err),
+            failure_stage="preparation",
+            progress_percent=0,
+            worker_id=None,
+        )
+        yield gr.update(), _render_status_panel("Workflow Error", f"Workflow update failed: {err}", accent="#f87171"), None
+        return
+
+    final_json = prepare_json(prompt, image_payload)
+    workflow_debug_path: Path | None = None
+    should_save_debug_json = bool(
+        os.getenv("SAVE_DEBUG_PROMPT_JSON", "0") == "1"
+        or (workflow_debug and is_admin_user)
+    )
+    if should_save_debug_json:
+        try:
+            workflow_debug_path = _save_workflow_debug_json(
+                final_json,
+                workflow_name=str(workflow or WORKFLOW_NAME),
+                task_id=task_id,
+            )
+        except Exception as err:
+            logger.warning("Could not save debug prompt JSON: %s", err)
+
+    api = RunpodAPI(environment=RUNPOD_ENVIRONMENT)
+    try:
+        run_resp = await api.run(final_json)
+        job_id = run_resp["id"]
+    except Exception as err:
+        tracker.fail(
+            failure_reason="submission_error",
+            error_message=str(err),
+            failure_stage="created",
+            progress_percent=0,
+            worker_id=None,
+        )
+        yield gr.update(), _render_status_panel("RunPod Error", f"Job submission failed: {err}", accent="#f87171"), None
+        return
+
+    tracker.attach_request(
+        request_id=job_id,
+        task_url=f"{api.base_url}/status/{job_id}",
+        retry_count=0,
+    )
+
+    submitted_message = "Preparing image"
+    if workflow_debug_path is not None:
+        submitted_message += f"\n\nDebug JSON saved: {workflow_debug_path}"
+    yield gr.update(), _render_status_panel("Preparing image", submitted_message, percent=3), job_id
+
+    for poll_idx in range(MAX_STATUS_POLLS):
+        try:
+            status = await api.status(job_id)
+        except Exception as err:
+            tracker.fail(
+                failure_reason="status_error",
+                error_message=str(err),
+                failure_stage="processing",
+                progress_percent=0,
+                worker_id=None,
+            )
+            yield gr.update(), _render_status_panel("RunPod Error", f"Failed to check job status: {err}", accent="#f87171"), None
+            return
+
+        state = (status.get("status") or "UNKNOWN").upper()
+        has_final_output = _has_final_output_payload(status)
+
+        if state in TERMINAL_FAILURES:
+            error_message = _extract_error_message(status)
+            tracker.fail(
+                failure_reason=f"runpod_{state.lower()}",
+                error_message=error_message,
+                failure_stage="processing",
+                progress_percent=0,
+                worker_id=status.get("workerId"),
+                metadata={"runpod_state": state},
+            )
+            yield gr.update(), _render_status_panel("RunPod Error", error_message, accent="#f87171"), None
+            return
+
+        if state == "COMPLETED" or has_final_output:
+            try:
+                result_image = await _decode_output_image(status)
+                if uses_padding_crop:
+                    result_image = _crop_to_dimensions(
+                        result_image,
+                        int(pil_images[0].width),
+                        int(pil_images[0].height),
+                    )
+            except Exception as err:
+                tracker.fail(
+                    failure_reason="decode_error",
+                    error_message=str(err),
+                    failure_stage="output_collecting",
+                    progress_percent=96,
+                    worker_id=status.get("workerId"),
+                )
+                yield gr.update(), _render_status_panel("Decode Error", f"Failed to decode image: {err}", accent="#f87171"), None
+                return
+
+            left_path = input_paths[0]
+            right_path = _save_temp_image(result_image, prefix="flux2_output")
+            artifacts = extract_artifacts_from_status(status)
+            thumbnail_path = tracker.add_thumbnail(image=result_image, output_index=0)
+            preview_path = tracker.add_preview(image=result_image, output_index=0)
+            tracker.add_output_record(
+                output_index=0,
+                result_url=artifacts.get("result_url"),
+                thumbnail_url=thumbnail_path,
+                preview_url=preview_path,
+                file_name=artifacts.get("output_filename") or right_path.name,
+                width=result_image.width,
+                height=result_image.height,
+            )
+            tracker.complete(
+                result_url=artifacts.get("result_url"),
+                thumbnail_url=thumbnail_path,
+                preview_url=preview_path,
+                output_filename=artifacts.get("output_filename") or right_path.name,
+                output_count=max(int(artifacts.get("output_count") or 0), 1),
+                output_width=result_image.width,
+                output_height=result_image.height,
+                worker_id=artifacts.get("worker_id"),
+                result_summary={
+                    "left_path": str(left_path),
+                    "right_path": str(right_path),
+                    "runpod_state": state,
+                    "mode": mode,
+                },
+            )
+            yield (str(left_path), str(right_path)), _render_status_panel("Image generated", "Image generated", percent=100), None
+            return
+
+        runpod_progress, progress_text, _ = _extract_progress_signal(status)
+        current_progress_text = progress_text
+        title, message, progress_percent = _describe_progress_status(
+            state,
+            current_progress_text,
+            has_final_output=has_final_output,
+            runpod_progress=runpod_progress,
+        )
+        status_panel = _render_status_panel(title, message, percent=progress_percent)
+
+        tracker.emit_processing(
+            stage=_processing_stage_name(state, has_final_output=has_final_output),
+            message=message,
+            progress_percent=progress_percent,
+            node_id=None,
+            metadata={
+                "poll_idx": poll_idx,
+                "runpod_state": state,
+                "mode": mode,
+                "progress_text": current_progress_text,
+                "runpod_progress": runpod_progress,
+            },
+        )
+        yield gr.update(), status_panel, job_id
+        await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
+
+    tracker.fail(
+        failure_reason="timeout",
+        error_message="Timed out waiting for RunPod completion status.",
+        failure_stage="processing",
+        progress_percent=0,
+        worker_id=None,
+    )
+    yield gr.update(), _render_status_panel("Timeout", "Timed out waiting for RunPod completion status.", accent="#f87171"), None
+
+
+async def cancel_job(job_id: str | None) -> str:
+    if not job_id:
+        return _render_status_panel("Nothing To Cancel", "No active job ID was found.", accent="#f59e0b")
+
+    api = RunpodAPI(environment=RUNPOD_ENVIRONMENT)
+    try:
+        await api.cancel(job_id)
+    except Exception as err:
+        return _render_status_panel("Cancel Error", f"Failed to cancel job: {err}", accent="#f87171")
+    return _render_status_panel("Cancelled", "Job cancellation requested.", accent="#f59e0b")
+
+
+def _build_flux2_klein_interface(
+    *,
+    heading: str,
+    workflow_name_value: str,
+) -> gr.Blocks:
+    with gr.Blocks(title=APP_TITLE, css=BOTTOM_PROGRESS_LAYOUT_CSS) as interface:
+        gr.Markdown(f"## {heading}")
+
+        workflow_name = gr.State(workflow_name_value)
+        job_id_state = gr.State(None)
+
+        with gr.Row(variant="panel"):
+            with gr.Column(scale=2):
+                mode_dropdown = gr.Dropdown(
+                    choices=MODE_CHOICES,
+                    value=MODE_EDIT,
+                    label="Mode",
+                )
+                image_count_dropdown = gr.Dropdown(
+                    choices=IMAGE_COUNT_CHOICES,
+                    value="1",
+                    label="Image Count",
+                    info="Only used in Edit mode.",
+                )
+                prompt_input = gr.Textbox(
+                    label="Prompt",
+                    placeholder="Describe the edit or target result...",
+                    lines=5,
+                )
+                mode_hint = gr.Markdown(MODE_HINTS[MODE_EDIT])
+                workflow_debug_checkbox = gr.Checkbox(
+                    label="Workflow Debug (Admin only)",
+                    value=False,
+                    visible=False,
+                    info="Save the final manipulated workflow JSON sent to RunPod.",
+                )
+
+            with gr.Column(scale=3):
+                result_slider = ImageSlider(label="Primary Input vs Result", type="filepath")
+
+        with gr.Row():
+            image_input_1 = gr.Image(label="Image 1", type="pil")
+            image_input_2 = gr.Image(label="Image 2", type="pil", visible=False)
+            image_input_3 = gr.Image(label="Image 3", type="pil", visible=False)
+
+        with gr.Row(elem_classes=["bottom-progress-row"]):
+            progress_panel = gr.HTML(_render_idle_status())
+
+        with gr.Row(elem_classes=["bottom-action-row"]):
+            generate_btn = gr.Button("🌟 Generate", scale=3, variant="primary")
+            cancel_btn = gr.Button("Cancel", variant="stop", scale=1)
+
+        mode_dropdown.change(
+            fn=_mode_controls_update,
+            inputs=[mode_dropdown, image_count_dropdown],
+            outputs=[
+                image_count_dropdown,
+                prompt_input,
+                image_input_1,
+                image_input_2,
+                image_input_3,
+                mode_hint,
+            ],
+        )
+        image_count_dropdown.change(
+            fn=_edit_count_update,
+            inputs=[mode_dropdown, image_count_dropdown],
+            outputs=[image_input_1, image_input_2, image_input_3],
+        )
+
+        generate_event = generate_btn.click(
+            fn=_disable_generate_button,
+            inputs=None,
+            outputs=[generate_btn],
+            queue=False,
+        )
+
+        generate_event = generate_event.then(
+            fn=flux2_klein_generate,
+            inputs=[
+                mode_dropdown,
+                image_count_dropdown,
+                image_input_1,
+                image_input_2,
+                image_input_3,
+                prompt_input,
+                workflow_debug_checkbox,
+                job_id_state,
+                workflow_name,
+            ],
+            outputs=[result_slider, progress_panel, job_id_state],
+            concurrency_limit=10,
+            trigger_mode="once",
+        )
+
+        generate_event.then(
+            fn=_enable_generate_button,
+            inputs=None,
+            outputs=[generate_btn],
+            queue=False,
+        )
+
+        cancel_btn.click(cancel_job, inputs=job_id_state, outputs=progress_panel).then(
+            fn=_enable_generate_button,
+            inputs=None,
+            outputs=[generate_btn],
+            queue=False,
+        )
+
+        interface.load(
+            fn=_debug_checkbox_visibility_update,
+            inputs=None,
+            outputs=[workflow_debug_checkbox],
+        )
+
+    return interface
+
+
+flux2_klein_interface = _build_flux2_klein_interface(
+    heading="Qwen Edit",
+    workflow_name_value=WORKFLOW_NAME,
+)
+
+
+if __name__ == "__main__":
+    flux2_klein_interface.launch(
+        server_name="0.0.0.0",
+        server_port=8171,
+        debug=APP_DEBUG,
+        quiet=APP_QUIET,
+        auth=auth_service.authenticate,
+        auth_message="BrickVisual internal access only.",
+    )

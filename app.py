@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html
 import hashlib
 import hmac
@@ -23,11 +23,19 @@ import gradio as gr
 import plotly.graph_objects as go
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from General_Enhancement_v04 import General_Enhancement_interface
 from analytics_store import get_analytics_store
 from auth_service import COMPANY_DOMAIN, get_auth_service
+from flux2_klein_image_edit_9b_distilled import flux2_klein_interface
+from reference_generator import reference_generator_interface
+from runpod_status_gadget import (
+    RUNPOD_STATUS_GADGET_REFRESH_S,
+    build_placeholder_html,
+    fetch_multiple_status_gadgets,
+)
 from server_upscaler_with_flux_enhancement import fivek
 
 APP_TITLE = "Momi-AI"
@@ -51,6 +59,25 @@ HISTORY_PORTAL_PROXY_PATH = os.getenv("HISTORY_PORTAL_PROXY_PATH", "/history-pro
 HISTORY_PORTAL_USE_PROXY = os.getenv("HISTORY_PORTAL_USE_PROXY", "1").strip().lower() in {"1", "true", "yes", "on"}
 HISTORY_PORTAL_SSO_SECRET = os.getenv("HISTORY_PORTAL_SSO_SECRET", "momi-forge-local-sso-secret").strip()
 HISTORY_PORTAL_SSO_TTL_SECONDS = max(60, int(os.getenv("HISTORY_PORTAL_SSO_TTL_SECONDS", "900")))
+RUNPOD_MANAGEMENT_PROXY_PATH = os.getenv("RUNPOD_MANAGEMENT_PROXY_PATH", "/runpod-management").strip() or "/runpod-management"
+RUNPOD_MANAGEMENT_URL = os.getenv("RUNPOD_MANAGEMENT_URL", RUNPOD_MANAGEMENT_PROXY_PATH).strip()
+RUNPOD_MANAGEMENT_DIST_DIR = Path(
+    os.getenv(
+        "RUNPOD_MANAGEMENT_DIST_DIR",
+        str(Path(__file__).resolve().parent / "runpod_management" / "webapp" / "frontend" / "dist"),
+    )
+)
+RUNPOD_MANAGEMENT_API_UPSTREAM_URL = os.getenv("RUNPOD_MANAGEMENT_API_UPSTREAM_URL", "https://127.0.0.1:8843").strip()
+RUNPOD_MANAGEMENT_COOKIE_NAME = "momi_runpod_management"
+RUNPOD_MANAGEMENT_SSO_TTL_SECONDS = max(60, int(os.getenv("RUNPOD_MANAGEMENT_SSO_TTL_SECONDS", str(HISTORY_PORTAL_SSO_TTL_SECONDS))))
+RUNPOD_MANAGEMENT_ROLES = {"admin", "ex"}
+ADMIN_ANALYTICS_ROLES = {"admin", "ex"}
+RUNPOD_BILLING_EMAILS = {"momen.sirri@brickvisual.com"}
+RUNPOD_REST_API_BASE = os.getenv("RUNPOD_REST_API_BASE", "https://rest.runpod.io/v1").strip().rstrip("/")
+RUNPOD_GRAPHQL_API_URL = os.getenv("RUNPOD_GRAPHQL_API_URL", "https://api.runpod.io/graphql").strip()
+RUNPOD_BILLING_TIMEOUT_S = float(os.getenv("RUNPOD_BILLING_TIMEOUT_S", "20"))
+RUNPOD_BILLING_TABLE_LIMIT = max(5, int(os.getenv("RUNPOD_BILLING_TABLE_LIMIT", "20")))
+RUNPOD_MONTHLY_BUDGET_USD = max(0.0, float(os.getenv("RUNPOD_MONTHLY_BUDGET_USD", "200")))
 
 ADMIN_OVERVIEW_DAYS = max(1, int(os.getenv("APP_ADMIN_OVERVIEW_DAYS", "30")))
 ADMIN_TABLE_LIMIT = max(5, int(os.getenv("APP_ADMIN_TABLE_LIMIT", "25")))
@@ -59,7 +86,19 @@ ADMIN_DATE_RANGE_CHOICES = [
     ("Last 24h", "1"),
     ("7 Days", "7"),
     ("30 Days", "30"),
+    ("All Time", "all"),
 ]
+ADMIN_AFTER_HOURS_GROUP_CHOICES = [
+    ("Per Day", "day"),
+    ("Per Week", "week"),
+    ("Per Month", "month"),
+]
+RUNPOD_BILLING_DATE_RANGE_CHOICES = [
+    ("Last 24h", "1"),
+    ("7 Days", "7"),
+    ("30 Days", "30"),
+]
+DEFAULT_ADMIN_AFTER_HOURS_GROUP = "day"
 ADMIN_DATE_RANGE_VALUES = {value for _, value in ADMIN_DATE_RANGE_CHOICES}
 DEFAULT_ADMIN_DATE_RANGE = str(ADMIN_OVERVIEW_DAYS)
 if DEFAULT_ADMIN_DATE_RANGE not in ADMIN_DATE_RANGE_VALUES:
@@ -72,6 +111,14 @@ WORKFLOW_DISPLAY_ALIASES: dict[str, str] = {
     "proupscaler": "Pro Upscaler",
     "generalenhancementv04": "General Enhancement",
     "generalenhancement": "General Enhancement",
+    "referencegenerator": "Reference Generator",
+    "referencegeneratorv02": "Reference Generator",
+    "reference_generator_v02": "Reference Generator",
+    "flux2kleinimageedit9bdistilled": "Qwen Edit",
+    "flux2kleinimageedit": "Qwen Edit",
+    "flux2klein": "Qwen Edit",
+    "flux2_klein": "Qwen Edit",
+    "qwenedit": "Qwen Edit",
 }
 
 WORKFLOW_HEADERS = ["Workflow", "Tasks", "Completed", "Failed", "Avg Duration (ms)"]
@@ -85,9 +132,38 @@ FAILURE_HEADERS = [
     "Task ID",
     "Request ID",
 ]
+WORKFLOW_STATUS_CONFIGS: list[tuple[str, str]] = [
+    ("General_Enhancement", "General Enhancement"),
+    ("seed", "Pro Upscaler"),
+    (
+        os.getenv("REFERENCE_GENERATOR_RUNPOD_ENVIRONMENT", "reference_generator"),
+        "Reference Generator",
+    ),
+    (os.getenv("FLUX2_KLEIN_RUNPOD_ENVIRONMENT", "flux2_klein"), "Qwen Edit"),
+]
+WORKFLOW_STATUS_REFRESH_TRIGGER_ID = "workflow-status-refresh-trigger"
+RUSH_HOUR_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 store = get_analytics_store()
 auth_service = get_auth_service()
+
+
+def _normalize_role(value: str | None) -> str:
+    role = (value or "").strip().lower()
+    return role if role in {"user", "admin", "ex"} else "user"
+
+
+def _can_view_admin_analytics(role: str | None) -> bool:
+    return _normalize_role(role) in ADMIN_ANALYTICS_ROLES
+
+
+def _can_view_runpod_management(role: str | None) -> bool:
+    return _normalize_role(role) in RUNPOD_MANAGEMENT_ROLES
+
+
+def _can_view_runpod_billing(email: str | None) -> bool:
+    return (email or "").strip().lower() in RUNPOD_BILLING_EMAILS
+
 
 EMBEDDED_HIDE_CSS = """
 .is-embedded .main-tabs {
@@ -363,6 +439,100 @@ EMBEDDED_HIDE_CSS = """
   border: 1px solid rgba(255, 106, 130, 0.35);
 }
 
+.admin-badge.neutral {
+  background: rgba(143, 154, 173, 0.16);
+  color: #c6d0df;
+  border: 1px solid rgba(143, 154, 173, 0.32);
+}
+
+.admin-group-row td {
+  position: sticky;
+  top: 37px;
+  z-index: 1;
+  background: #151b24;
+  color: #f0f4fb;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.admin-after-hours-card {
+  margin-top: 14px;
+}
+
+.admin-rush-insights {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(180px, 0.7fr) minmax(280px, 1.4fr) minmax(280px, 1.4fr);
+  gap: 14px;
+  align-items: stretch;
+  margin: 12px 0 14px;
+}
+
+.admin-rush-card {
+  background: linear-gradient(145deg, rgba(20, 27, 37, 0.92), rgba(14, 18, 24, 0.82));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  padding: 16px;
+  min-height: 120px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.admin-rush-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8fb9d8;
+}
+
+.admin-rush-value {
+  margin-top: 10px;
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1.15;
+  color: #f6f8fc;
+}
+
+.admin-rush-sub {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #a9b3c4;
+}
+
+.admin-rush-table-card {
+  padding: 12px;
+}
+
+.admin-rush-table-card .admin-table-wrap {
+  max-height: 220px;
+}
+
+.runpod-spend-shell {
+  gap: 18px !important;
+  margin-top: 10px;
+}
+
+.runpod-spend-table .admin-table-wrap {
+  max-height: 430px;
+}
+
+.runpod-budget-card.is-good {
+  border-color: rgba(76, 217, 147, 0.34);
+}
+
+.runpod-budget-card.is-warn {
+  border-color: rgba(247, 184, 75, 0.42);
+  box-shadow: 0 0 28px rgba(247, 184, 75, 0.08);
+}
+
+.runpod-budget-card.is-bad {
+  border-color: rgba(255, 106, 130, 0.48);
+  box-shadow: 0 0 28px rgba(255, 106, 130, 0.1);
+}
+
+.admin-kpi-sub.is-warn {
+  color: #f7c96f;
+}
+
 .admin-status-line {
   color: #9db0ca;
   margin: 0;
@@ -373,6 +543,149 @@ EMBEDDED_HIDE_CSS = """
   color: #8f9aad;
   padding: 14px;
   text-align: center;
+}
+
+.admin-nested-tabs {
+  margin-top: 0 !important;
+}
+
+.runpod-management-embed {
+  padding-top: 14px;
+  background: #030507;
+}
+
+.runpod-management-frame {
+  display: block;
+  width: 100%;
+  min-height: 680px;
+  height: calc(100vh - 235px);
+  border: 0;
+  border-radius: 12px;
+  background: #030507;
+}
+
+.runpod-management-fallback {
+  margin: 10px 0 0;
+  color: #9db0ca;
+  font-size: 13px;
+}
+
+.runpod-management-fallback a {
+  color: #8fc7ff;
+  font-weight: 700;
+}
+
+@media (max-width: 1200px) {
+  .admin-rush-insights {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .admin-rush-insights {
+    grid-template-columns: 1fr;
+  }
+}
+
+.workflow-status-slot {
+  margin: 6px 0 8px !important;
+}
+
+.workflow-status-slot > div {
+  min-height: 0 !important;
+}
+
+.runpod-status-gadget {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(11, 16, 24, 0.74);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+}
+
+.runpod-status-gadget:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(15, 21, 31, 0.86);
+}
+
+.runpod-status-gadget:active {
+  transform: translateY(1px);
+}
+
+.runpod-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  color: #8f9aad;
+  background: currentColor;
+  box-shadow: 0 0 0 0 currentColor;
+  animation: runpod-status-pulse 1.8s ease-out infinite;
+}
+
+.runpod-status-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #dbe4f3;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
+}
+
+.runpod-status-alert {
+  min-width: 18px;
+}
+
+.runpod-status-ok .runpod-status-dot {
+  color: #53d38a;
+}
+
+.runpod-status-busy .runpod-status-dot {
+  color: #f0b44f;
+}
+
+.runpod-status-error .runpod-status-dot {
+  color: #ff6b81;
+}
+
+.runpod-status-error .runpod-status-alert {
+  background: rgba(255, 107, 129, 0.18);
+  color: #ffb7c1;
+  border: 1px solid rgba(255, 107, 129, 0.26);
+}
+
+@keyframes runpod-status-pulse {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(0, 0, 0, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(0, 0, 0, 0);
+  }
+}
+
+.workflow-status-refresh-trigger {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
 .momi-splash-overlay {
@@ -662,7 +975,14 @@ def _embedded_mode_detector_html() -> str:
       window.addEventListener("beforeunload", () => observer.disconnect(), { once: true });
     })();
     </script>
-    """
+"""
+
+
+async def _load_workflow_status_gadgets() -> tuple[str, ...]:
+    return await fetch_multiple_status_gadgets(
+        WORKFLOW_STATUS_CONFIGS,
+        WORKFLOW_STATUS_REFRESH_TRIGGER_ID,
+    )
 
 
 def _app_splash_html() -> str:
@@ -700,6 +1020,22 @@ def _app_splash_html() -> str:
         {loader_html}
       </div>
     </div>
+    """
+
+
+def _workflow_status_refresh_bridge_html() -> str:
+    return f"""
+    <script>
+    (() => {{
+      window.momiRefreshWorkflowStatus = (targetId) => {{
+        const host = document.getElementById(targetId || "{WORKFLOW_STATUS_REFRESH_TRIGGER_ID}");
+        const button = host ? host.querySelector("button") : null;
+        if (button) {{
+          button.click();
+        }}
+      }};
+    }})();
+    </script>
     """
 
 
@@ -762,6 +1098,13 @@ def _normalized_history_proxy_path() -> str:
     return path.rstrip("/") or "/history-proxy"
 
 
+def _normalized_runpod_management_proxy_path() -> str:
+    path = (RUNPOD_MANAGEMENT_PROXY_PATH or "/runpod-management").strip()
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return path.rstrip("/") or "/runpod-management"
+
+
 def _history_portal_upstream_base_url() -> str:
     configured = (HISTORY_PORTAL_URL or "").strip()
     parsed = urlparse(configured if "://" in configured else f"http://{configured}")
@@ -798,6 +1141,124 @@ def _build_history_portal_sso_url(email: str | None, base_url: str | None = None
     return f"{base_url}/?{query}"
 
 
+def _runpod_management_signature(email: str, role: str, exp: int, nonce: str) -> str:
+    payload = f"runpod-management\n{email}\n{_normalize_role(role)}\n{exp}\n{nonce}"
+    return hmac.new(
+        HISTORY_PORTAL_SSO_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _pack_runpod_management_cookie(email: str, role: str, exp: int, nonce: str, sig: str) -> str:
+    raw = f"{email}\n{_normalize_role(role)}\n{exp}\n{nonce}\n{sig}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _unpack_runpod_management_cookie(value: str | None) -> tuple[str, str, int, str, str] | None:
+    if not value:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        email, role, exp_text, nonce, sig = decoded.split("\n", 4)
+        return email, _normalize_role(role), int(exp_text), nonce, sig
+    except Exception:
+        return None
+
+
+def _verify_runpod_management_token(
+    email: str | None,
+    role: str | None,
+    exp: int | str | None,
+    nonce: str | None,
+    sig: str | None,
+) -> bool:
+    normalized_email = (email or "").strip().lower()
+    normalized_role = _normalize_role(role)
+    if not normalized_email or not _can_view_runpod_management(normalized_role) or not exp or not nonce or not sig:
+        return False
+    try:
+        exp_int = int(exp)
+    except (TypeError, ValueError):
+        return False
+    if exp_int < int(time.time()):
+        return False
+    expected = _runpod_management_signature(normalized_email, normalized_role, exp_int, nonce)
+    return hmac.compare_digest(expected, str(sig))
+
+
+def _current_runpod_management_role(email: str | None) -> str | None:
+    normalized_email = (email or "").strip().lower()
+    if not normalized_email:
+        return None
+    try:
+        identity = auth_service.get_identity(normalized_email)
+    except Exception:
+        return None
+    role = _normalize_role(getattr(identity, "role", None))
+    return role if _can_view_runpod_management(role) else None
+
+
+def _authorize_runpod_management_request(request: Request) -> tuple[str, str] | None:
+    query = request.query_params
+    email = query.get("email")
+    role = query.get("role")
+    exp = query.get("exp")
+    nonce = query.get("nonce")
+    sig = query.get("sig")
+    if _verify_runpod_management_token(email, role, exp, nonce, sig):
+        effective_role = _current_runpod_management_role(email)
+        if effective_role:
+            normalized_email = (email or "").strip().lower()
+            exp_int = int(exp or 0)
+            next_sig = _runpod_management_signature(normalized_email, effective_role, exp_int, nonce or "")
+            return (
+                _pack_runpod_management_cookie(normalized_email, effective_role, exp_int, nonce or "", next_sig),
+                effective_role,
+            )
+
+    cookie_data = _unpack_runpod_management_cookie(request.cookies.get(RUNPOD_MANAGEMENT_COOKIE_NAME))
+    if cookie_data:
+        cookie_email, cookie_role, cookie_exp, cookie_nonce, cookie_sig = cookie_data
+        if _verify_runpod_management_token(cookie_email, cookie_role, cookie_exp, cookie_nonce, cookie_sig):
+            effective_role = _current_runpod_management_role(cookie_email)
+            if effective_role:
+                next_sig = _runpod_management_signature(cookie_email, effective_role, cookie_exp, cookie_nonce)
+                return (
+                    _pack_runpod_management_cookie(cookie_email, effective_role, cookie_exp, cookie_nonce, next_sig),
+                    effective_role,
+                )
+
+    return None
+
+
+def _build_runpod_management_url(email: str | None, role: str | None) -> str:
+    configured = (RUNPOD_MANAGEMENT_URL or "").strip() or _normalized_runpod_management_proxy_path()
+    if configured.startswith(("http://", "https://")):
+        return configured
+
+    base_url = configured.rstrip("/") or _normalized_runpod_management_proxy_path()
+    normalized_email = (email or "").strip().lower()
+    normalized_role = _normalize_role(role)
+    if not normalized_email or not _can_view_runpod_management(normalized_role) or not HISTORY_PORTAL_SSO_SECRET:
+        return f"{base_url}/"
+
+    exp = int(time.time()) + RUNPOD_MANAGEMENT_SSO_TTL_SECONDS
+    nonce = secrets.token_urlsafe(12)
+    sig = _runpod_management_signature(normalized_email, normalized_role, exp, nonce)
+    query = urlencode(
+        {
+            "email": normalized_email,
+            "role": normalized_role,
+            "exp": exp,
+            "nonce": nonce,
+            "sig": sig,
+        }
+    )
+    return f"{base_url}/?{query}"
+
+
 def _history_portal_html(portal_url: str | None = None) -> str:
     target_url = (portal_url or "").strip() or _normalized_history_proxy_path()
     safe_url = html.escape(target_url, quote=True)
@@ -809,6 +1270,25 @@ def _history_portal_html(portal_url: str | None = None) -> str:
         title="Momi-AI History Portal"
         style="display:block;width:100%;height:calc(100vh - 220px);border:0;border-radius:12px;background:#030507;"
       ></iframe>
+    </div>
+    """
+
+
+def _runpod_management_html(management_url: str | None = None) -> str:
+    target_url = (management_url or "").strip() or _normalized_runpod_management_proxy_path()
+    safe_url = html.escape(target_url, quote=True)
+    return f"""
+    <div class="runpod-management-embed">
+      <iframe
+        id="momi-runpod-management-frame"
+        class="runpod-management-frame"
+        src="{safe_url}"
+        title="RunPod Management"
+      ></iframe>
+      <p class="runpod-management-fallback">
+        If the management console does not appear, open it directly:
+        <a href="{safe_url}" target="_blank" rel="noopener noreferrer">RunPod Management</a>
+      </p>
     </div>
     """
 
@@ -874,7 +1354,7 @@ def _admin_summary_html(summary: dict[str, Any], window_days: int) -> str:
 
     return (
         "<div style='display:flex;flex-wrap:wrap;gap:12px;'>"
-        f"<div><b>Window:</b> last {window_days} day(s)</div>"
+        f"<div><b>Window:</b> {_format_admin_window_label(window_days)}</div>"
         f"<div><b>Total Tasks:</b> {total}</div>"
         f"<div><b>Completed:</b> {completed}</div>"
         f"<div><b>Failed:</b> {failed}</div>"
@@ -924,11 +1404,23 @@ def _overview_tables(overview: dict[str, Any]) -> tuple[list[list[Any]], list[li
 
 
 def _coerce_days(value: str | int | None) -> int:
+    if str(value or "").strip().lower() in {"all", "all time", "0"}:
+        return 0
     try:
         parsed = int(str(value or "").strip())
     except ValueError:
         parsed = ADMIN_OVERVIEW_DAYS
     return max(1, parsed)
+
+
+def _format_admin_window_label(days: int) -> str:
+    return "all time" if int(days or 0) <= 0 else f"last {days} day(s)"
+
+
+def _coerce_after_hours_group(value: str | None) -> str:
+    allowed = {group_value for _, group_value in ADMIN_AFTER_HOURS_GROUP_CHOICES}
+    parsed = str(value or DEFAULT_ADMIN_AFTER_HOURS_GROUP).strip().lower()
+    return parsed if parsed in allowed else DEFAULT_ADMIN_AFTER_HOURS_GROUP
 
 
 def _format_duration(ms: Any) -> str:
@@ -956,6 +1448,552 @@ def _format_admin_dt(value: Any) -> str:
         return text
 
 
+def _format_admin_dt_seconds(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text
+
+
+def _format_money(value: Any) -> str:
+    try:
+        amount = float(value or 0.0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f"${amount:,.2f}"
+
+
+def _format_runpod_billed_time(value_ms: Any) -> str:
+    try:
+        total_seconds = int(float(value_ms or 0) / 1000)
+    except (TypeError, ValueError):
+        total_seconds = 0
+    if total_seconds <= 0:
+        return "-"
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _runpod_billing_bucket(days: int) -> str:
+    if days <= 1:
+        return "hour"
+    if days <= 31:
+        return "day"
+    return "week"
+
+
+def _runpod_billing_time_params(days: int) -> dict[str, str]:
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=max(1, days))
+    return {
+        "startTime": start_dt.isoformat().replace("+00:00", "Z"),
+        "endTime": end_dt.isoformat().replace("+00:00", "Z"),
+        "bucketSize": _runpod_billing_bucket(days),
+    }
+
+
+def _runpod_api_key() -> str:
+    return os.getenv("RUNPOD_API_KEY", "").strip()
+
+
+def _runpod_auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_runpod_api_key()}"}
+
+
+def _normalize_runpod_billing_record(raw: dict[str, Any], product: str) -> dict[str, Any]:
+    resource_id = raw.get("podId") or raw.get("endpointId") or raw.get("instanceId") or "-"
+    return {
+        "product": product,
+        "amount": float(raw.get("amount") or 0.0),
+        "time": str(raw.get("time") or ""),
+        "time_billed_ms": int(raw.get("timeBilledMs") or raw.get("timeBilledSeconds") or 0)
+        if raw.get("timeBilledMs") is not None
+        else int(raw.get("timeBilledSeconds") or 0) * 1000,
+        "disk_space_billed_gb": raw.get("diskSpaceBilledGb") or raw.get("diskSpaceBilledGB"),
+        "resource_id": str(resource_id),
+        "gpu_type_id": str(raw.get("gpuTypeId") or "-"),
+    }
+
+
+def _runpod_workflow_resource_map() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for environment, label in WORKFLOW_STATUS_CONFIGS:
+        env_key = str(environment or "").strip().upper()
+        resource_id = os.getenv(f"RUNPOD_POD_ID_{env_key}", "").strip()
+        if resource_id:
+            mapping[resource_id] = label
+    return mapping
+
+
+def _runpod_record_workflow(row: dict[str, Any], resource_map: dict[str, str] | None = None) -> str:
+    mapping = resource_map if resource_map is not None else _runpod_workflow_resource_map()
+    resource_id = str(row.get("resource_id") or "").strip()
+    return mapping.get(resource_id, "Unmapped RunPod")
+
+
+def _runpod_daily_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d")
+    except ValueError:
+        return text[:10] if len(text) >= 10 else text
+
+
+def _fetch_runpod_rest_billing(client: httpx.Client, resource: str, days: int) -> list[dict[str, Any]]:
+    product = "Pods" if resource == "pods" else "Serverless"
+    params = _runpod_billing_time_params(days)
+    if resource == "pods":
+        params["grouping"] = "podId"
+    elif resource == "endpoints":
+        params["grouping"] = "endpointId"
+
+    response = client.get(
+        f"{RUNPOD_REST_API_BASE}/billing/{resource}",
+        headers=_runpod_auth_headers(),
+        params=params,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        return []
+    return [
+        _normalize_runpod_billing_record(item, product)
+        for item in payload
+        if isinstance(item, dict)
+    ]
+
+
+def _fetch_runpod_account_snapshot(client: httpx.Client) -> dict[str, Any]:
+    query = """
+    query MomiRunpodAccountSnapshot {
+      myself {
+        currentSpendPerHr
+        clientBalance
+        clientLifetimeSpend
+        spendLimit
+      }
+    }
+    """
+    response = client.post(
+        RUNPOD_GRAPHQL_API_URL,
+        headers={**_runpod_auth_headers(), "Content-Type": "application/json"},
+        json={"query": query},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("errors"):
+        return {}
+    myself = ((payload.get("data") or {}).get("myself") or {})
+    return myself if isinstance(myself, dict) else {}
+
+
+def _fetch_runpod_spend(days: int, *, include_account: bool = True) -> dict[str, Any]:
+    if not _runpod_api_key():
+        return {
+            "ok": False,
+            "errors": ["RUNPOD_API_KEY is not configured on the server."],
+            "records": [],
+            "account": {},
+        }
+    if not RUNPOD_REST_API_BASE:
+        return {
+            "ok": False,
+            "errors": ["RUNPOD_REST_API_BASE is not configured."],
+            "records": [],
+            "account": {},
+        }
+
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    account: dict[str, Any] = {}
+    with httpx.Client(timeout=RUNPOD_BILLING_TIMEOUT_S) as client:
+        for resource in ("pods", "endpoints"):
+            try:
+                records.extend(_fetch_runpod_rest_billing(client, resource, days))
+            except Exception as err:
+                errors.append(f"{resource}: {err}")
+        if include_account:
+            try:
+                account = _fetch_runpod_account_snapshot(client)
+            except Exception as err:
+                errors.append(f"account snapshot: {err}")
+
+    return {
+        "ok": not errors or bool(records),
+        "errors": errors,
+        "records": records,
+        "account": account,
+    }
+
+
+def _fetch_runpod_period_spends(days_values: list[int]) -> dict[int, dict[str, Any]]:
+    period_spends: dict[int, dict[str, Any]] = {}
+    for days in days_values:
+        period_spends[days] = _fetch_runpod_spend(days, include_account=False)
+    return period_spends
+
+
+def _summarize_runpod_spend(records: list[dict[str, Any]]) -> dict[str, Any]:
+    total = sum(float(row.get("amount") or 0.0) for row in records)
+    pods_total = sum(float(row.get("amount") or 0.0) for row in records if row.get("product") == "Pods")
+    serverless_total = sum(float(row.get("amount") or 0.0) for row in records if row.get("product") == "Serverless")
+    billed_ms = sum(int(row.get("time_billed_ms") or 0) for row in records)
+    pods_billed_ms = sum(int(row.get("time_billed_ms") or 0) for row in records if row.get("product") == "Pods")
+    return {
+        "total": total,
+        "pods_total": pods_total,
+        "serverless_total": serverless_total,
+        "billed_ms": billed_ms,
+        "pods_billed_ms": pods_billed_ms,
+    }
+
+
+def _runpod_period_total(period_spends: dict[int, dict[str, Any]], days: int) -> float:
+    return float(_summarize_runpod_spend(period_spends.get(days, {}).get("records", [])).get("total") or 0.0)
+
+
+def _days_in_current_month() -> int:
+    now = datetime.now()
+    if now.month == 12:
+        next_month = now.replace(year=now.year + 1, month=1, day=1)
+    else:
+        next_month = now.replace(month=now.month + 1, day=1)
+    this_month = now.replace(day=1)
+    return max(28, (next_month - this_month).days)
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _project_runpod_monthly_spend(account: dict[str, Any], month_total: float) -> float:
+    current_rate = _coerce_float(account.get("currentSpendPerHr"))
+    if current_rate is None:
+        return month_total
+    return max(month_total, current_rate * 24 * _days_in_current_month())
+
+
+def _runpod_budget_state(projected_monthly: float, budget: float) -> tuple[str, str]:
+    if budget <= 0:
+        return "neutral", "No monthly budget configured"
+    ratio = projected_monthly / budget if budget else 0.0
+    if ratio >= 1.0:
+        return "bad", f"Over budget by {_format_money(projected_monthly - budget)}"
+    if ratio >= 0.8:
+        return "warn", f"{ratio * 100:.0f}% of monthly budget"
+    return "good", f"{ratio * 100:.0f}% of monthly budget"
+
+
+def _render_runpod_spend_summary_html(
+    spend: dict[str, Any],
+    days: int,
+    period_spends: dict[int, dict[str, Any]] | None = None,
+) -> str:
+    summary = _summarize_runpod_spend(spend.get("records", []))
+    period_spends = period_spends or {}
+    account = spend.get("account", {}) or {}
+    current_spend = account.get("currentSpendPerHr")
+    balance = account.get("clientBalance")
+    lifetime = account.get("clientLifetimeSpend")
+    today_total = _runpod_period_total(period_spends, 1) if period_spends else summary["total"]
+    week_total = _runpod_period_total(period_spends, 7) if period_spends else summary["total"]
+    month_total = _runpod_period_total(period_spends, 30) if period_spends else summary["total"]
+    projected_monthly = _project_runpod_monthly_spend(account, month_total)
+    budget_class, budget_message = _runpod_budget_state(projected_monthly, RUNPOD_MONTHLY_BUDGET_USD)
+
+    current_text = _format_money(current_spend) + "/hr" if current_spend is not None else "-"
+    balance_text = _format_money(balance) if balance is not None else "-"
+    lifetime_text = _format_money(lifetime) if lifetime is not None else "-"
+    budget_text = _format_money(RUNPOD_MONTHLY_BUDGET_USD) if RUNPOD_MONTHLY_BUDGET_USD > 0 else "-"
+
+    return f"""
+    <div class="admin-kpi-grid">
+      <div class="admin-kpi-card">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Today</div>
+          <div class="admin-kpi-icon" aria-hidden="true">$</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(_format_money(today_total))}</div>
+        <div class="admin-kpi-sub">Last 24 hours</div>
+      </div>
+      <div class="admin-kpi-card">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Week</div>
+          <div class="admin-kpi-icon" aria-hidden="true">7d</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(_format_money(week_total))}</div>
+        <div class="admin-kpi-sub">Last 7 days</div>
+      </div>
+      <div class="admin-kpi-card">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Month</div>
+          <div class="admin-kpi-icon" aria-hidden="true">30</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(_format_money(month_total))}</div>
+        <div class="admin-kpi-sub">Last 30 days</div>
+      </div>
+      <div class="admin-kpi-card runpod-budget-card is-{html.escape(budget_class)}">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Projected Month</div>
+          <div class="admin-kpi-icon" aria-hidden="true">!</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(_format_money(projected_monthly))}</div>
+        <div class="admin-kpi-sub is-{html.escape(budget_class)}">{html.escape(budget_message)} / budget {html.escape(budget_text)}</div>
+      </div>
+      <div class="admin-kpi-card">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Current Rate</div>
+          <div class="admin-kpi-icon" aria-hidden="true">/h</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(current_text)}</div>
+        <div class="admin-kpi-sub">Balance: {html.escape(balance_text)}</div>
+      </div>
+      <div class="admin-kpi-card">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Pods</div>
+          <div class="admin-kpi-icon" aria-hidden="true">P</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(_format_money(summary["pods_total"]))}</div>
+        <div class="admin-kpi-sub">Billed time: {html.escape(_format_runpod_billed_time(summary["pods_billed_ms"]))}</div>
+      </div>
+      <div class="admin-kpi-card">
+        <div class="admin-kpi-head">
+          <div class="admin-kpi-label">Serverless</div>
+          <div class="admin-kpi-icon" aria-hidden="true">S</div>
+        </div>
+        <div class="admin-kpi-value">{html.escape(_format_money(summary["serverless_total"]))}</div>
+        <div class="admin-kpi-sub">Lifetime: {html.escape(lifetime_text)}</div>
+      </div>
+    </div>
+    """
+
+
+def _build_runpod_spend_plot(spend: dict[str, Any]) -> go.Figure:
+    records = spend.get("records", [])
+    fig = go.Figure()
+    if not records:
+        fig.add_annotation(
+            text="No RunPod billing data in selected range",
+            showarrow=False,
+            font={"size": 13, "color": "#92a0b5"},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_layout(**_base_plot_layout("Daily RunPod Spend"))
+        return fig
+
+    by_day_product: dict[str, dict[str, float]] = {}
+    for row in records:
+        day_key = _runpod_daily_key(row.get("time"))
+        product = str(row.get("product") or "Other")
+        by_day_product.setdefault(day_key, {})
+        by_day_product[day_key][product] = by_day_product[day_key].get(product, 0.0) + float(row.get("amount") or 0.0)
+
+    x_values = sorted(by_day_product)
+    palette = {"Pods": "#3fa9f5", "Serverless": "#47d793"}
+    for product in ("Pods", "Serverless"):
+        fig.add_trace(
+            go.Bar(
+                x=x_values,
+                y=[round(by_day_product.get(day_key, {}).get(product, 0.0), 4) for day_key in x_values],
+                name=product,
+                marker={"color": palette.get(product, "#ff9b3d")},
+                hovertemplate="%{x}<br>%{fullData.name}: $%{y:.4f}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(**_base_plot_layout("Daily RunPod Spend"))
+    fig.update_layout(barmode="stack")
+    fig.update_xaxes(showgrid=False, tickfont={"color": "#9fb0c8"})
+    fig.update_yaxes(title="USD", gridcolor="rgba(255,255,255,0.08)", zeroline=False)
+    return fig
+
+
+def _render_runpod_spend_table_html(spend: dict[str, Any]) -> str:
+    rows = spend.get("records", [])
+    resource_map = _runpod_workflow_resource_map()
+    workflow_grouped: dict[str, dict[str, Any]] = {
+        label: {
+            "workflow_name": label,
+            "amount": 0.0,
+            "pods_amount": 0.0,
+            "serverless_amount": 0.0,
+            "time_billed_ms": 0,
+        }
+        for _environment, label in WORKFLOW_STATUS_CONFIGS
+    }
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        workflow_name = _runpod_record_workflow(row, resource_map)
+        workflow_item = workflow_grouped.setdefault(
+            workflow_name,
+            {
+                "workflow_name": workflow_name,
+                "amount": 0.0,
+                "pods_amount": 0.0,
+                "serverless_amount": 0.0,
+                "time_billed_ms": 0,
+            },
+        )
+        amount = float(row.get("amount") or 0.0)
+        workflow_item["amount"] += amount
+        workflow_item["time_billed_ms"] += int(row.get("time_billed_ms") or 0)
+        if row.get("product") == "Pods":
+            workflow_item["pods_amount"] += amount
+        elif row.get("product") == "Serverless":
+            workflow_item["serverless_amount"] += amount
+
+        key = (
+            str(row.get("product") or "-"),
+            str(row.get("resource_id") or "-"),
+            str(row.get("gpu_type_id") or "-"),
+        )
+        item = grouped.setdefault(
+            key,
+            {
+                "product": key[0],
+                "resource_id": key[1],
+                "gpu_type_id": key[2],
+                "workflow_name": workflow_name,
+                "amount": 0.0,
+                "time_billed_ms": 0,
+                "last_time": "",
+            },
+        )
+        item["amount"] += float(row.get("amount") or 0.0)
+        item["time_billed_ms"] += int(row.get("time_billed_ms") or 0)
+        item["last_time"] = max(str(item.get("last_time") or ""), str(row.get("time") or ""))
+        if item.get("workflow_name") == "Unmapped RunPod" and workflow_name != "Unmapped RunPod":
+            item["workflow_name"] = workflow_name
+
+    workflow_ranked = sorted(workflow_grouped.values(), key=lambda item: float(item.get("amount") or 0.0), reverse=True)
+    workflow_body = ""
+    for row in workflow_ranked:
+        workflow_body += (
+            "<tr>"
+            f"<td>{html.escape(str(row.get('workflow_name') or '-'))}</td>"
+            f"<td>{html.escape(_format_money(row.get('amount')))}</td>"
+            f"<td>{html.escape(_format_money(row.get('pods_amount')))}</td>"
+            f"<td>{html.escape(_format_money(row.get('serverless_amount')))}</td>"
+            f"<td>{html.escape(_format_runpod_billed_time(row.get('time_billed_ms')))}</td>"
+            "</tr>"
+        )
+
+    if not workflow_body:
+        workflow_body = "<tr><td colspan='5' class='admin-empty'>No workflow cost rows in this range.</td></tr>"
+
+    ranked = sorted(grouped.values(), key=lambda item: float(item.get("amount") or 0.0), reverse=True)
+    body = ""
+    for row in ranked[:RUNPOD_BILLING_TABLE_LIMIT]:
+        body += (
+            "<tr>"
+            f"<td>{html.escape(str(row.get('product') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('workflow_name') or '-'))}</td>"
+            f"<td class='admin-mono'>{html.escape(str(row.get('resource_id') or '-'))}</td>"
+            f"<td>{html.escape(str(row.get('gpu_type_id') or '-'))}</td>"
+            f"<td>{html.escape(_format_money(row.get('amount')))}</td>"
+            f"<td>{html.escape(_format_runpod_billed_time(row.get('time_billed_ms')))}</td>"
+            f"<td>{html.escape(_format_admin_dt(row.get('last_time')))}</td>"
+            "</tr>"
+        )
+
+    if not body:
+        body = "<tr><td colspan='7' class='admin-empty'>No RunPod billing rows in this range.</td></tr>"
+
+    return f"""
+    <div class="admin-table-card runpod-spend-table">
+      <h3 class="admin-table-title">Per Workflow Cost</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Workflow</th>
+              <th>Total Spend</th>
+              <th>Pods</th>
+              <th>Serverless</th>
+              <th>Billed Time</th>
+            </tr>
+          </thead>
+          <tbody>{workflow_body}</tbody>
+        </table>
+      </div>
+    </div>
+    <div class="admin-table-card runpod-spend-table">
+      <h3 class="admin-table-title">Top Expensive Pods / Endpoints</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Product</th>
+              <th>Workflow</th>
+              <th>Resource</th>
+              <th>GPU</th>
+              <th>Spend</th>
+              <th>Billed Time</th>
+              <th>Last Bucket</th>
+            </tr>
+          </thead>
+          <tbody>{body}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+
+def _build_runpod_spend_dashboard(days: int) -> tuple[str, str, go.Figure | None, str]:
+    spend = _fetch_runpod_spend(days)
+    period_spends = _fetch_runpod_period_spends([1, 7, 30]) if spend.get("ok") else {}
+    plot = _safe_plot_render(lambda: _build_runpod_spend_plot(spend))
+    period_errors: list[str] = []
+    for period_days, period_spend in period_spends.items():
+        for error in period_spend.get("errors", [])[:1]:
+            period_errors.append(f"{period_days}d {error}")
+    error_text = "; ".join((spend.get("errors", []) + period_errors)[:2])
+    if not spend.get("ok"):
+        status = "<p class='admin-status-line'>RunPod spend is unavailable. "
+        status += html.escape(error_text or "Check the server RunPod API configuration.")
+        status += "</p>"
+    elif error_text:
+        status = (
+            f"<p class='admin-status-line'>RunPod spend loaded for {html.escape(_format_admin_window_label(days))}. "
+            f"Partial warning: {html.escape(error_text)}</p>"
+        )
+    else:
+        status = f"<p class='admin-status-line'>RunPod spend loaded for {html.escape(_format_admin_window_label(days))}.</p>"
+
+    return (
+        status,
+        _render_runpod_spend_summary_html(spend, days, period_spends),
+        plot,
+        _render_runpod_spend_table_html(spend),
+    )
+
+
 def _build_kpi_cards_html(summary: dict[str, Any], *, days: int) -> str:
     total_tasks = int(summary.get("total_tasks") or 0)
     success_rate = float(summary.get("success_rate_percent") or 0.0)
@@ -971,7 +2009,7 @@ def _build_kpi_cards_html(summary: dict[str, Any], *, days: int) -> str:
           <div class="admin-kpi-icon" aria-hidden="true">◉</div>
         </div>
         <div class="admin-kpi-value">{total_tasks}</div>
-        <div class="admin-kpi-sub">Window: last {days} day(s)</div>
+        <div class="admin-kpi-sub">Window: {html.escape(_format_admin_window_label(days))}</div>
       </div>
       <div class="admin-kpi-card">
         <div class="admin-kpi-head">
@@ -1012,8 +2050,8 @@ def _base_plot_layout(title: str) -> dict[str, Any]:
     }
 
 
-def _empty_admin_plots() -> tuple[None, None, None]:
-    return (None, None, None)
+def _empty_admin_plots() -> tuple[None, None, None, None]:
+    return (None, None, None, None)
 
 
 def _safe_plot_render(plot_factory: Callable[[], go.Figure]) -> go.Figure | None:
@@ -1155,6 +2193,191 @@ def _build_performance_plot(workflow_rows: list[dict[str, Any]]) -> go.Figure:
     return fig
 
 
+def _format_hour_window(hour: Any) -> str:
+    try:
+        value = max(0, min(23, int(hour)))
+    except (TypeError, ValueError):
+        value = 0
+    return f"{value:02d}:00-{value:02d}:59"
+
+
+def _build_rush_hour_heatmap(rush_hour: dict[str, Any]) -> go.Figure:
+    fig = go.Figure()
+    slots = rush_hour.get("slots", [])
+    if not slots:
+        fig.add_annotation(
+            text="No rush-hour data in selected range",
+            showarrow=False,
+            font={"size": 13, "color": "#92a0b5"},
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_layout(**_base_plot_layout("Rush Hour Heatmap"))
+        return fig
+
+    by_slot = {
+        (int(row.get("weekday") or 0), int(row.get("hour") or 0)): row
+        for row in slots
+    }
+    z_values: list[list[int]] = []
+    hover_values: list[list[str]] = []
+    for weekday_idx, weekday_name in enumerate(RUSH_HOUR_WEEKDAYS):
+        z_row: list[int] = []
+        hover_row: list[str] = []
+        for hour in range(24):
+            row = by_slot.get((weekday_idx, hour), {})
+            total = int(row.get("total_tasks") or 0)
+            completed = int(row.get("completed_tasks") or 0)
+            failed = int(row.get("failed_tasks") or 0)
+            active_users = int(row.get("active_users") or 0)
+            avg_duration = _format_duration(row.get("avg_total_duration_ms"))
+            fail_rate = (failed / total * 100.0) if total else 0.0
+            z_row.append(total)
+            hover_row.append(
+                f"{weekday_name} {_format_hour_window(hour)}<br>"
+                f"Tasks: {total}<br>"
+                f"Completed: {completed}<br>"
+                f"Failed: {failed} ({fail_rate:.1f}%)<br>"
+                f"Avg duration: {html.escape(avg_duration)}<br>"
+                f"Active users: {active_users}"
+            )
+        z_values.append(z_row)
+        hover_values.append(hover_row)
+
+    fig.add_trace(
+        go.Heatmap(
+            z=z_values,
+            x=[f"{hour:02d}:00" for hour in range(24)],
+            y=RUSH_HOUR_WEEKDAYS,
+            customdata=hover_values,
+            colorscale=[
+                [0.0, "#10141a"],
+                [0.25, "#175a76"],
+                [0.55, "#2fbf8f"],
+                [0.78, "#f7b84b"],
+                [1.0, "#ff5c7a"],
+            ],
+            colorbar={
+                "title": {"text": "Tasks", "font": {"color": "#d5dfef"}},
+                "tickcolor": "#9fb0c8",
+                "tickfont": {"color": "#9fb0c8"},
+            },
+            hovertemplate="%{customdata}<extra></extra>",
+        )
+    )
+    fig.update_layout(**_base_plot_layout("Rush Hour Heatmap"))
+    fig.update_layout(height=430)
+    fig.update_xaxes(title="Hour of Day", showgrid=False, tickangle=-45, tickfont={"color": "#9fb0c8"})
+    fig.update_yaxes(title="Day", showgrid=False, tickfont={"color": "#9fb0c8"})
+    return fig
+
+
+def _render_rush_hour_insights_html(rush_hour: dict[str, Any]) -> str:
+    slots = rush_hour.get("slots", [])
+    forecast = rush_hour.get("forecast", [])
+    total_tasks = int(rush_hour.get("total_tasks") or 0)
+
+    top_slots = sorted(
+        slots,
+        key=lambda row: (-int(row.get("total_tasks") or 0), int(row.get("weekday") or 0), int(row.get("hour") or 0)),
+    )[:5]
+
+    if top_slots:
+        busiest = top_slots[0]
+        busiest_weekday = RUSH_HOUR_WEEKDAYS[int(busiest.get("weekday") or 0)]
+        busiest_text = f"{busiest_weekday} {_format_hour_window(busiest.get('hour'))}"
+        busiest_tasks = int(busiest.get("total_tasks") or 0)
+        duration_text = _format_duration(busiest.get("avg_total_duration_ms"))
+    else:
+        busiest_text = "-"
+        busiest_tasks = 0
+        duration_text = "-"
+
+    top_items = ""
+    for row in top_slots:
+        weekday = RUSH_HOUR_WEEKDAYS[int(row.get("weekday") or 0)]
+        total = int(row.get("total_tasks") or 0)
+        failed = int(row.get("failed_tasks") or 0)
+        fail_rate = (failed / total * 100.0) if total else 0.0
+        top_items += (
+            "<tr>"
+            f"<td>{html.escape(weekday)}</td>"
+            f"<td>{html.escape(_format_hour_window(row.get('hour')))}</td>"
+            f"<td>{total}</td>"
+            f"<td>{html.escape(_format_duration(row.get('avg_total_duration_ms')))}</td>"
+            f"<td>{fail_rate:.1f}%</td>"
+            "</tr>"
+        )
+
+    if not top_items:
+        top_items = "<tr><td colspan='5' class='admin-empty'>No rush windows in this range.</td></tr>"
+
+    forecast_items = ""
+    for row in forecast[:5]:
+        weekday = RUSH_HOUR_WEEKDAYS[int(row.get("weekday") or 0)]
+        forecast_items += (
+            "<tr>"
+            f"<td>{html.escape(str(row.get('date') or '-'))}</td>"
+            f"<td>{html.escape(weekday)}</td>"
+            f"<td>{html.escape(_format_hour_window(row.get('hour')))}</td>"
+            f"<td>{float(row.get('expected_tasks') or 0):.2f}</td>"
+            "</tr>"
+        )
+
+    if not forecast_items:
+        forecast_items = "<tr><td colspan='4' class='admin-empty'>Forecast needs more historical task volume.</td></tr>"
+
+    return f"""
+    <div class="admin-rush-insights">
+      <div class="admin-rush-card">
+        <div class="admin-rush-label">Busiest Window</div>
+        <div class="admin-rush-value">{html.escape(busiest_text)}</div>
+        <div class="admin-rush-sub">{busiest_tasks} task(s), avg {html.escape(duration_text)}</div>
+      </div>
+      <div class="admin-rush-card">
+        <div class="admin-rush-label">Analyzed Tasks</div>
+        <div class="admin-rush-value">{total_tasks}</div>
+        <div class="admin-rush-sub">Based on the selected analytics window</div>
+      </div>
+      <div class="admin-table-card admin-rush-table-card">
+        <h3 class="admin-table-title">Top Rush Windows</h3>
+        <div class="admin-table-wrap">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>Day</th>
+                <th>Hour</th>
+                <th>Tasks</th>
+                <th>Avg Duration</th>
+                <th>Fail Rate</th>
+              </tr>
+            </thead>
+            <tbody>{top_items}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="admin-table-card admin-rush-table-card">
+        <h3 class="admin-table-title">Next Likely Rush Windows</h3>
+        <div class="admin-table-wrap">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Day</th>
+                <th>Hour</th>
+                <th>Expected Tasks</th>
+              </tr>
+            </thead>
+            <tbody>{forecast_items}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    """
+
+
 def _match_search(value: str, search_query: str) -> bool:
     if not search_query:
         return True
@@ -1267,26 +2490,109 @@ def _render_failures_table_html(rows: list[dict[str, Any]], search_query: str) -
     """
 
 
+def _status_badge_html(status: Any) -> str:
+    label = str(status or "unknown").strip() or "unknown"
+    css_class = "success" if label.lower() == "completed" else "error" if label.lower() == "failed" else "neutral"
+    return f"<span class='admin-badge {css_class}'>{html.escape(label.title())}</span>"
+
+
+def _render_after_hours_table_html(rows: list[dict[str, Any]], search_query: str, group_by: str) -> str:
+    query = (search_query or "").strip().lower()
+    filtered = [
+        row for row in rows
+        if _match_search(str(row.get("user_email") or ""), query)
+        or _match_search(str(row.get("user_prefix") or ""), query)
+        or _match_search(str(row.get("user_display_name") or ""), query)
+        or _match_search(str(row.get("workflow_name") or ""), query)
+        or _match_search(_format_workflow_display_name(row.get("workflow_name")), query)
+    ]
+
+    group_label = {
+        "week": "Week",
+        "month": "Month",
+    }.get(group_by, "Day")
+
+    body = ""
+    current_group = None
+    for row in filtered:
+        row_group = str(row.get("group_label") or "-")
+        if row_group != current_group:
+            current_group = row_group
+            body += (
+                "<tr class='admin-group-row'>"
+                f"<td colspan='7'>{html.escape(group_label)}: {html.escape(row_group)}</td>"
+                "</tr>"
+            )
+
+        workflow_display = _format_workflow_display_name(row.get("workflow_name"))
+        user_name = row.get("user_display_name") or row.get("user_prefix") or row.get("user_email") or "-"
+        body += (
+            "<tr>"
+            f"<td>{html.escape(_format_admin_dt_seconds(row.get('handled_at')))}</td>"
+            f"<td>{html.escape(str(user_name))}</td>"
+            f"<td class='admin-mono'>{html.escape(str(row.get('user_email') or '-'))}</td>"
+            f"<td>{html.escape(workflow_display)}</td>"
+            f"<td>{html.escape(_format_duration(row.get('total_duration_ms')))}</td>"
+            f"<td>{_status_badge_html(row.get('status'))}</td>"
+            f"<td class='admin-mono'>{html.escape(str(row.get('task_id') or '-'))}</td>"
+            "</tr>"
+        )
+
+    if not body:
+        body = "<tr><td colspan='7' class='admin-empty'>No matching after-hours tasks after 6:00 PM.</td></tr>"
+
+    return f"""
+    <div class="admin-table-card admin-after-hours-card">
+      <h3 class="admin-table-title">Tasks Handled After 6:00 PM</h3>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Exact Time</th>
+              <th>User Name</th>
+              <th>User Email</th>
+              <th>Workflow</th>
+              <th>Duration</th>
+              <th>Status</th>
+              <th>Task ID</th>
+            </tr>
+          </thead>
+          <tbody>{body}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+
 def _build_admin_dashboard(
-    days: int, search_query: str
-) -> tuple[str, str, go.Figure | None, go.Figure | None, go.Figure | None, str, str]:
+    days: int, search_query: str, after_hours_group: str = DEFAULT_ADMIN_AFTER_HOURS_GROUP
+) -> tuple[str, str, go.Figure | None, go.Figure | None, go.Figure | None, go.Figure | None, str, str, str, str]:
     dashboard = store.get_admin_dashboard(days=days, limit=ADMIN_DASHBOARD_TABLE_LIMIT)
+    after_hours_group = _coerce_after_hours_group(after_hours_group)
+    after_hours = store.get_admin_after_hours_tasks(
+        days=days,
+        group_by=after_hours_group,
+        limit=ADMIN_DASHBOARD_TABLE_LIMIT,
+    )
+    rush_hour = store.get_admin_rush_hour_analytics(days=days)
     summary = dashboard.get("summary", {})
     trend_rows = dashboard.get("trend", [])
     workflow_rows = dashboard.get("workflows", [])
     users_rows = dashboard.get("top_users", [])
     failures_rows = dashboard.get("recent_failures", [])
+    after_hours_rows = after_hours.get("items", [])
     trend_plot = _safe_plot_render(lambda: _build_trend_plot(trend_rows))
     workflow_plot = _safe_plot_render(lambda: _build_workflow_distribution_plot(workflow_rows))
     performance_plot = _safe_plot_render(lambda: _build_performance_plot(workflow_rows))
+    rush_hour_plot = _safe_plot_render(lambda: _build_rush_hour_heatmap(rush_hour))
 
-    if trend_plot is None or workflow_plot is None or performance_plot is None:
+    if trend_plot is None or workflow_plot is None or performance_plot is None or rush_hour_plot is None:
         status_text = (
-            f"<p class='admin-status-line'>Admin analytics is active. Window: last {days} day(s). "
+            f"<p class='admin-status-line'>Admin analytics is active. Window: {html.escape(_format_admin_window_label(days))}. "
             "Chart rendering is currently unavailable on this server runtime.</p>"
         )
     else:
-        status_text = f"<p class='admin-status-line'>Admin analytics is active. Window: last {days} day(s).</p>"
+        status_text = f"<p class='admin-status-line'>Admin analytics is active. Window: {html.escape(_format_admin_window_label(days))}.</p>"
 
     return (
         status_text,
@@ -1294,8 +2600,11 @@ def _build_admin_dashboard(
         trend_plot,
         workflow_plot,
         performance_plot,
+        rush_hour_plot,
+        _render_rush_hour_insights_html(rush_hour),
         _render_users_table_html(users_rows, search_query),
         _render_failures_table_html(failures_rows, search_query),
+        _render_after_hours_table_html(after_hours_rows, search_query, after_hours_group),
     )
 
 
@@ -1303,7 +2612,7 @@ def _load_portal_data(request: gr.Request):
     history_base_url = _resolve_history_portal_base_url(request)
     email = getattr(request, "username", None)
     if not email:
-        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
+        trend_plot, workflow_plot, performance_plot, rush_hour_plot = _empty_admin_plots()
         return (
             _topbar_html("-", "Unknown User", None),
             "<p class='admin-status-line'>Admin access is unavailable.</p>",
@@ -1311,33 +2620,51 @@ def _load_portal_data(request: gr.Request):
             trend_plot,
             workflow_plot,
             performance_plot,
+            rush_hour_plot,
+            _render_rush_hour_insights_html({}),
             _render_users_table_html([], ""),
             _render_failures_table_html([], ""),
+            _render_after_hours_table_html([], "", DEFAULT_ADMIN_AFTER_HOURS_GROUP),
             _history_portal_html(history_base_url),
+            "",
             gr.update(visible=False),
         )
 
     identity = auth_service.get_identity(email)
     history_url = _build_history_portal_sso_url(identity.email, history_base_url)
 
-    is_admin = str(getattr(identity, "role", "") or "").strip().lower() == "admin"
+    user_role = _normalize_role(getattr(identity, "role", None))
+    can_view_admin = _can_view_admin_analytics(user_role)
+    can_view_runpod = _can_view_runpod_management(user_role)
+    can_view_runpod_billing = _can_view_runpod_billing(identity.email)
 
-    if is_admin:
+    if can_view_admin:
         (
             admin_hint,
             admin_summary,
             trend_plot,
             workflow_plot,
             performance_plot,
+            rush_hour_plot,
+            rush_hour_insights_html,
             users_table_html,
             failures_table_html,
+            after_hours_table_html,
         ) = _build_admin_dashboard(ADMIN_OVERVIEW_DAYS, "")
     else:
-        admin_hint = "<p class='admin-status-line'>Admin analytics is restricted to admin users.</p>"
+        admin_hint = "<p class='admin-status-line'>Admin analytics is restricted to admin and executive users.</p>"
         admin_summary = ""
-        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
+        trend_plot, workflow_plot, performance_plot, rush_hour_plot = _empty_admin_plots()
+        rush_hour_insights_html = _render_rush_hour_insights_html({})
         users_table_html = _render_users_table_html([], "")
         failures_table_html = _render_failures_table_html([], "")
+        after_hours_table_html = _render_after_hours_table_html([], "", DEFAULT_ADMIN_AFTER_HOURS_GROUP)
+
+    runpod_management_html = (
+        _runpod_management_html(_build_runpod_management_url(identity.email, user_role))
+        if can_view_runpod
+        else ""
+    )
 
     return (
         _topbar_html(identity.email, identity.display_name, identity.avatar_path),
@@ -1346,97 +2673,236 @@ def _load_portal_data(request: gr.Request):
         trend_plot,
         workflow_plot,
         performance_plot,
+        rush_hour_plot,
+        rush_hour_insights_html,
         users_table_html,
         failures_table_html,
+        after_hours_table_html,
         _history_portal_html(history_url),
-        gr.update(visible=is_admin),
+        runpod_management_html,
+        gr.update(visible=can_view_admin or can_view_runpod or can_view_runpod_billing),
     )
 
 
-def _refresh_admin(date_range: str, search_query: str, request: gr.Request):
+def _refresh_admin(date_range: str, search_query: str, after_hours_group: str, request: gr.Request):
     email = getattr(request, "username", None)
     if not email:
-        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
+        trend_plot, workflow_plot, performance_plot, rush_hour_plot = _empty_admin_plots()
         return (
             "<p class='admin-status-line'>Admin access is unavailable.</p>",
             "",
             trend_plot,
             workflow_plot,
             performance_plot,
+            rush_hour_plot,
+            _render_rush_hour_insights_html({}),
             _render_users_table_html([], ""),
             _render_failures_table_html([], ""),
+            _render_after_hours_table_html([], "", _coerce_after_hours_group(after_hours_group)),
         )
 
     identity = auth_service.get_identity(email)
-    if str(getattr(identity, "role", "") or "").strip().lower() != "admin":
-        trend_plot, workflow_plot, performance_plot = _empty_admin_plots()
+    if not _can_view_admin_analytics(getattr(identity, "role", None)):
+        trend_plot, workflow_plot, performance_plot, rush_hour_plot = _empty_admin_plots()
         return (
-            "<p class='admin-status-line'>Admin analytics is restricted to admin users.</p>",
+            "<p class='admin-status-line'>Admin analytics is restricted to admin and executive users.</p>",
             "",
             trend_plot,
             workflow_plot,
             performance_plot,
+            rush_hour_plot,
+            _render_rush_hour_insights_html({}),
             _render_users_table_html([], ""),
             _render_failures_table_html([], ""),
+            _render_after_hours_table_html([], "", _coerce_after_hours_group(after_hours_group)),
         )
 
     days = _coerce_days(date_range)
-    return _build_admin_dashboard(days, search_query or "")
+    return _build_admin_dashboard(days, search_query or "", after_hours_group)
+
+
+def _refresh_runpod_spend(date_range: str, request: gr.Request):
+    email = getattr(request, "username", None)
+    if not email:
+        return (
+            "<p class='admin-status-line'>RunPod spend access is unavailable.</p>",
+            "",
+            None,
+            "",
+        )
+
+    identity = auth_service.get_identity(email)
+    if not _can_view_runpod_billing(identity.email):
+        return (
+            "<p class='admin-status-line'>RunPod spend is restricted to the configured owner.</p>",
+            "",
+            None,
+            "",
+        )
+
+    days = _coerce_days(date_range)
+    return _build_runpod_spend_dashboard(days)
 
 
 with gr.Blocks(title=APP_TITLE, css=EMBEDDED_HIDE_CSS) as app:
     gr.HTML(_app_splash_html())
     gr.HTML(_embedded_mode_detector_html())
+    gr.HTML(_workflow_status_refresh_bridge_html())
 
     user_header = gr.HTML(_topbar_html("-", "Loading", None), elem_classes=["app-shell-header"])
+    workflow_status_refresh_trigger = gr.Button(
+        "",
+        elem_id=WORKFLOW_STATUS_REFRESH_TRIGGER_ID,
+        elem_classes=["workflow-status-refresh-trigger"],
+    )
 
     with gr.Tabs(elem_classes=["main-tabs"]):
         with gr.Tab("General Enhancement"):
+            general_status_gadget = gr.HTML(
+                build_placeholder_html(WORKFLOW_STATUS_REFRESH_TRIGGER_ID),
+                elem_classes=["workflow-status-slot"],
+            )
             General_Enhancement_interface.render()
 
         with gr.Tab("Pro Upscaler"):
+            pro_upscaler_status_gadget = gr.HTML(
+                build_placeholder_html(WORKFLOW_STATUS_REFRESH_TRIGGER_ID),
+                elem_classes=["workflow-status-slot"],
+            )
             fivek.render()
+
+        with gr.Tab("Reference Generator"):
+            reference_generator_status_gadget = gr.HTML(
+                build_placeholder_html(WORKFLOW_STATUS_REFRESH_TRIGGER_ID),
+                elem_classes=["workflow-status-slot"],
+            )
+            reference_generator_interface.render()
+
+        with gr.Tab("Qwen Edit"):
+            qwen_status_gadget = gr.HTML(
+                build_placeholder_html(WORKFLOW_STATUS_REFRESH_TRIGGER_ID),
+                elem_classes=["workflow-status-slot"],
+            )
+            flux2_klein_interface.render()
 
         with gr.Tab("History"):
             history_portal_shell = gr.HTML(_history_portal_html())
 
         with gr.Tab("Admin Analytics", visible=False) as admin_tab:
-            with gr.Column(elem_classes=["admin-dashboard-shell"]):
-                with gr.Row(elem_classes=["admin-dashboard-controls"]):
-                    admin_date_range = gr.Dropdown(
-                        choices=ADMIN_DATE_RANGE_CHOICES,
-                        value=DEFAULT_ADMIN_DATE_RANGE,
-                        label="Date Range",
-                    )
-                    admin_search = gr.Textbox(
-                        label="Search",
-                        placeholder="Filter by user email or workflow...",
-                    )
-                    refresh_admin_btn = gr.Button(
-                        "Refresh",
-                        variant="secondary",
-                        elem_classes=["admin-refresh-btn"],
-                    )
+            with gr.Tabs(elem_classes=["admin-nested-tabs"]):
+                with gr.Tab("Analytics"):
+                    with gr.Column(elem_classes=["admin-dashboard-shell"]):
+                        with gr.Row(elem_classes=["admin-dashboard-controls"]):
+                            admin_date_range = gr.Dropdown(
+                                choices=ADMIN_DATE_RANGE_CHOICES,
+                                value=DEFAULT_ADMIN_DATE_RANGE,
+                                label="Date Range",
+                            )
+                            admin_search = gr.Textbox(
+                                label="Search",
+                                placeholder="Filter by user email or workflow...",
+                            )
+                            admin_after_hours_group = gr.Dropdown(
+                                choices=ADMIN_AFTER_HOURS_GROUP_CHOICES,
+                                value=DEFAULT_ADMIN_AFTER_HOURS_GROUP,
+                                label="After-Hours Grouping",
+                            )
+                            refresh_admin_btn = gr.Button(
+                                "Refresh",
+                                variant="secondary",
+                                elem_classes=["admin-refresh-btn"],
+                            )
 
-                admin_status = gr.HTML("<p class='admin-status-line'>Loading admin analytics...</p>")
-                admin_summary = gr.HTML("")
+                        admin_status = gr.HTML("<p class='admin-status-line'>Loading admin analytics...</p>")
+                        admin_summary = gr.HTML("")
 
-                with gr.Row():
-                    tasks_trend_plot = gr.Plot(label="Tasks Over Time", elem_classes=["admin-chart-card"])
+                        with gr.Row():
+                            tasks_trend_plot = gr.Plot(label="Tasks Over Time", elem_classes=["admin-chart-card"])
 
-                with gr.Row():
-                    workflow_distribution_plot = gr.Plot(
-                        label="Workflow Distribution",
-                        elem_classes=["admin-chart-card"],
-                    )
-                    performance_plot = gr.Plot(
-                        label="Avg Duration by Workflow",
-                        elem_classes=["admin-chart-card"],
-                    )
+                        with gr.Row():
+                            workflow_distribution_plot = gr.Plot(
+                                label="Workflow Distribution",
+                                elem_classes=["admin-chart-card"],
+                            )
+                            performance_plot = gr.Plot(
+                                label="Avg Duration by Workflow",
+                                elem_classes=["admin-chart-card"],
+                            )
 
-                with gr.Row():
-                    top_users_table = gr.HTML("")
-                    recent_failures_table = gr.HTML("")
+                        with gr.Row():
+                            rush_hour_plot = gr.Plot(
+                                label="Rush Hour Heatmap",
+                                elem_classes=["admin-chart-card"],
+                            )
+
+                        rush_hour_insights = gr.HTML("")
+
+                        with gr.Row():
+                            top_users_table = gr.HTML("")
+                            recent_failures_table = gr.HTML("")
+
+                        after_hours_table = gr.HTML("")
+
+                with gr.Tab("RunPod Spend"):
+                    with gr.Column(elem_classes=["runpod-spend-shell"]):
+                        with gr.Row(elem_classes=["admin-dashboard-controls"]):
+                            runpod_spend_date_range = gr.Dropdown(
+                                choices=RUNPOD_BILLING_DATE_RANGE_CHOICES,
+                                value="30",
+                                label="Date Range",
+                            )
+                            refresh_runpod_spend_btn = gr.Button(
+                                "Refresh",
+                                variant="secondary",
+                                elem_classes=["admin-refresh-btn"],
+                            )
+
+                        runpod_spend_status = gr.HTML("<p class='admin-status-line'>Loading RunPod spend...</p>")
+                        runpod_spend_summary = gr.HTML("")
+                        runpod_spend_plot = gr.Plot(label="Daily RunPod Spend", elem_classes=["admin-chart-card"])
+                        runpod_spend_table = gr.HTML("")
+
+                with gr.Tab("RunPod Management"):
+                    runpod_management_shell = gr.HTML("")
+
+    workflow_status_timer = gr.Timer(value=RUNPOD_STATUS_GADGET_REFRESH_S, active=True)
+
+    app.load(
+        fn=_load_workflow_status_gadgets,
+        inputs=None,
+        outputs=[
+            general_status_gadget,
+            pro_upscaler_status_gadget,
+            reference_generator_status_gadget,
+            qwen_status_gadget,
+        ],
+        queue=False,
+        show_progress="hidden",
+    )
+    workflow_status_timer.tick(
+        fn=_load_workflow_status_gadgets,
+        inputs=None,
+        outputs=[
+            general_status_gadget,
+            pro_upscaler_status_gadget,
+            reference_generator_status_gadget,
+            qwen_status_gadget,
+        ],
+        queue=False,
+        show_progress="hidden",
+    )
+    workflow_status_refresh_trigger.click(
+        fn=_load_workflow_status_gadgets,
+        inputs=None,
+        outputs=[
+            general_status_gadget,
+            pro_upscaler_status_gadget,
+            reference_generator_status_gadget,
+            qwen_status_gadget,
+        ],
+        queue=False,
+        show_progress="hidden",
+    )
 
     app.load(
         fn=_load_portal_data,
@@ -1448,9 +2914,13 @@ with gr.Blocks(title=APP_TITLE, css=EMBEDDED_HIDE_CSS) as app:
             tasks_trend_plot,
             workflow_distribution_plot,
             performance_plot,
+            rush_hour_plot,
+            rush_hour_insights,
             top_users_table,
             recent_failures_table,
+            after_hours_table,
             history_portal_shell,
+            runpod_management_shell,
             admin_tab,
         ],
         js="""
@@ -1470,45 +2940,106 @@ with gr.Blocks(title=APP_TITLE, css=EMBEDDED_HIDE_CSS) as app:
         """,
     )
 
+    app.load(
+        fn=_refresh_runpod_spend,
+        inputs=[runpod_spend_date_range],
+        outputs=[
+            runpod_spend_status,
+            runpod_spend_summary,
+            runpod_spend_plot,
+            runpod_spend_table,
+        ],
+        queue=False,
+        show_progress="hidden",
+    )
+
     refresh_admin_btn.click(
         fn=_refresh_admin,
-        inputs=[admin_date_range, admin_search],
+        inputs=[admin_date_range, admin_search, admin_after_hours_group],
         outputs=[
             admin_status,
             admin_summary,
             tasks_trend_plot,
             workflow_distribution_plot,
             performance_plot,
+            rush_hour_plot,
+            rush_hour_insights,
             top_users_table,
             recent_failures_table,
+            after_hours_table,
+        ],
+    )
+
+    refresh_runpod_spend_btn.click(
+        fn=_refresh_runpod_spend,
+        inputs=[runpod_spend_date_range],
+        outputs=[
+            runpod_spend_status,
+            runpod_spend_summary,
+            runpod_spend_plot,
+            runpod_spend_table,
+        ],
+    )
+
+    runpod_spend_date_range.change(
+        fn=_refresh_runpod_spend,
+        inputs=[runpod_spend_date_range],
+        outputs=[
+            runpod_spend_status,
+            runpod_spend_summary,
+            runpod_spend_plot,
+            runpod_spend_table,
         ],
     )
 
     admin_date_range.change(
         fn=_refresh_admin,
-        inputs=[admin_date_range, admin_search],
+        inputs=[admin_date_range, admin_search, admin_after_hours_group],
         outputs=[
             admin_status,
             admin_summary,
             tasks_trend_plot,
             workflow_distribution_plot,
             performance_plot,
+            rush_hour_plot,
+            rush_hour_insights,
             top_users_table,
             recent_failures_table,
+            after_hours_table,
         ],
     )
 
     admin_search.change(
         fn=_refresh_admin,
-        inputs=[admin_date_range, admin_search],
+        inputs=[admin_date_range, admin_search, admin_after_hours_group],
         outputs=[
             admin_status,
             admin_summary,
             tasks_trend_plot,
             workflow_distribution_plot,
             performance_plot,
+            rush_hour_plot,
+            rush_hour_insights,
             top_users_table,
             recent_failures_table,
+            after_hours_table,
+        ],
+    )
+
+    admin_after_hours_group.change(
+        fn=_refresh_admin,
+        inputs=[admin_date_range, admin_search, admin_after_hours_group],
+        outputs=[
+            admin_status,
+            admin_summary,
+            tasks_trend_plot,
+            workflow_distribution_plot,
+            performance_plot,
+            rush_hour_plot,
+            rush_hour_insights,
+            top_users_table,
+            recent_failures_table,
+            after_hours_table,
         ],
     )
 
@@ -1517,9 +3048,31 @@ def _create_server_app() -> FastAPI:
     server_app = FastAPI()
     proxy_path = _normalized_history_proxy_path()
     upstream_base = _history_portal_upstream_base_url().rstrip("/")
+    runpod_proxy_path = _normalized_runpod_management_proxy_path()
+    runpod_api_upstream_base = (RUNPOD_MANAGEMENT_API_UPSTREAM_URL or "https://127.0.0.1:8843").rstrip("/")
+    runpod_assets_dir = RUNPOD_MANAGEMENT_DIST_DIR / "assets"
+
+    @server_app.middleware("http")
+    async def _default_gradio_dark_theme(request: Request, call_next: Callable[[Request], Any]) -> Response:
+        accept = request.headers.get("accept", "")
+        wants_html = not accept or "text/html" in accept or "*/*" in accept
+        if (
+            request.method in {"GET", "HEAD"}
+            and request.url.path == "/"
+            and "__theme" not in request.query_params
+            and wants_html
+        ):
+            return RedirectResponse(str(request.url.include_query_params(__theme="dark")), status_code=307)
+        return await call_next(request)
 
     if SPLASH_ASSETS_DIR.is_dir():
         server_app.mount("/splash-assets", StaticFiles(directory=str(SPLASH_ASSETS_DIR)), name="splash-assets")
+    if runpod_assets_dir.is_dir():
+        server_app.mount(
+            f"{runpod_proxy_path}/assets",
+            StaticFiles(directory=str(runpod_assets_dir)),
+            name="runpod-management-assets",
+        )
 
     hop_by_hop_headers = {
         "connection",
@@ -1560,6 +3113,101 @@ def _create_server_app() -> FastAPI:
         except httpx.HTTPError as error:
             return Response(
                 content=f"History upstream unavailable: {error}",
+                status_code=502,
+                media_type="text/plain; charset=utf-8",
+            )
+
+        response_headers: dict[str, str] = {}
+        for key, value in upstream_response.headers.items():
+            if key.lower() in hop_by_hop_headers:
+                continue
+            response_headers[key] = value
+
+        return Response(
+            content=upstream_response.content,
+            status_code=upstream_response.status_code,
+            headers=response_headers,
+            media_type=upstream_response.headers.get("content-type"),
+        )
+
+    @server_app.get(runpod_proxy_path)
+    @server_app.get(f"{runpod_proxy_path}/")
+    async def _runpod_management_index(request: Request) -> Response:
+        access = _authorize_runpod_management_request(request)
+        if not access:
+            return Response(
+                content="RunPod Management requires an active management session.",
+                status_code=403,
+                media_type="text/plain; charset=utf-8",
+            )
+        access_cookie, _access_role = access
+
+        index_file = RUNPOD_MANAGEMENT_DIST_DIR / "index.html"
+        if not index_file.is_file():
+            return Response(
+                content=(
+                    "RunPod Management build was not found. "
+                    f"Expected index file: {index_file}"
+                ),
+                status_code=502,
+                media_type="text/plain; charset=utf-8",
+            )
+
+        index_html = index_file.read_text(encoding="utf-8")
+        asset_prefix = f"{runpod_proxy_path}/assets/"
+        index_html = (
+            index_html
+            .replace('src="/assets/', f'src="{asset_prefix}')
+            .replace('href="/assets/', f'href="{asset_prefix}')
+        )
+        response = Response(content=index_html, media_type="text/html; charset=utf-8")
+        response.set_cookie(
+            RUNPOD_MANAGEMENT_COOKIE_NAME,
+            access_cookie,
+            max_age=RUNPOD_MANAGEMENT_SSO_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
+
+    @server_app.api_route("/api/{runpod_api_tail:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+    async def _runpod_api_proxy(request: Request, runpod_api_tail: str = "") -> Response:
+        access = _authorize_runpod_management_request(request)
+        if not access:
+            return Response(
+                content="RunPod Management API requires an active management session.",
+                status_code=403,
+                media_type="text/plain; charset=utf-8",
+            )
+        _access_cookie, access_role = access
+
+        target_path = f"/api/{(runpod_api_tail or '').lstrip('/')}"
+        target_url = f"{runpod_api_upstream_base}{target_path}"
+        if request.url.query:
+            target_url = f"{target_url}?{request.url.query}"
+
+        forward_headers: dict[str, str] = {}
+        for key, value in request.headers.items():
+            key_lower = key.lower()
+            if key_lower in hop_by_hop_headers or key_lower == "host":
+                continue
+            forward_headers[key] = value
+        forward_headers["x-user-role"] = access_role
+
+        body = await request.body()
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0, verify=False) as client:
+                upstream_response = await client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=forward_headers,
+                    content=body if body else None,
+                )
+        except httpx.HTTPError as error:
+            return Response(
+                content=f"RunPod Management upstream unavailable: {error}",
                 status_code=502,
                 media_type="text/plain; charset=utf-8",
             )
