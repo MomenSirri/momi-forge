@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import html
 import json
 import logging
@@ -21,7 +22,11 @@ from PIL import Image
 from gradio_imageslider import ImageSlider
 
 from auth_service import get_auth_service
-from runpod_api_class import RunpodAPI
+from runpod_api_class import (
+    RunpodAPI,
+    RunpodSubmissionError,
+    RunpodSubmissionUncertainError,
+)
 from task_tracking import TaskTracker, WorkflowContext, extract_artifacts_from_status
 from utils import (
     _decode_output_image,
@@ -760,6 +765,532 @@ def _edit_count_update(mode: str, image_count: str | int | None):
     )
 
 
+class Flux2PreparationError(RuntimeError):
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+@dataclass
+class Flux2PreparedInputs:
+    workflow_key: str
+    image_count: int
+    prompt: dict[str, Any]
+    pil_images: list[Image.Image]
+    input_paths: list[Path]
+    image_names: list[str]
+    image_payload: list[dict[str, Any]]
+    uses_padding_crop: bool
+    task_id: str
+    feature_flags: dict[str, Any]
+    settings_snapshot: dict[str, Any]
+
+
+@dataclass
+class Flux2PreparedJob:
+    inputs: Flux2PreparedInputs
+    payload: dict[str, Any]
+    workflow_debug_path: Path | None
+
+
+@dataclass
+class Flux2SubmissionResult:
+    job_id: str | None
+    error_message: str | None = None
+    uncertain: bool = False
+
+
+@dataclass
+class Flux2FinalizedOutput:
+    result_image: Image.Image | None = None
+    left_path: Path | None = None
+    right_path: Path | None = None
+    artifacts: dict[str, Any] | None = None
+    error_message: str | None = None
+
+
+@dataclass
+class Flux2PollEvent:
+    kind: str
+    status: dict[str, Any]
+    title: str
+    message: str
+    progress_percent: int
+    stage: str
+    poll_idx: int
+    finalized: Flux2FinalizedOutput | None = None
+    runpod_progress: int | float | None = None
+    progress_text: str | None = None
+
+
+def _prepare_flux2_inputs(
+    *,
+    mode: str,
+    edit_image_count: str | int | None,
+    image_1: Any,
+    image_2: Any,
+    image_3: Any,
+    prompt_text: str,
+    realistic_strength: float,
+    workflow: str,
+) -> Flux2PreparedInputs:
+    workflow_key = (
+        REALISTIC_WORKFLOW_NAME
+        if mode == MODE_REALISTIC
+        else str(workflow or WORKFLOW_NAME)
+    )
+    image_count = _effective_image_count(mode, edit_image_count)
+    try:
+        _validate_mode_inputs(
+            mode=mode,
+            image_count=image_count,
+            image_1=image_1,
+            image_2=image_2,
+            image_3=image_3,
+        )
+    except Exception as err:
+        raise Flux2PreparationError("Input Error", str(err)) from err
+
+    try:
+        prompt_path = _resolve_flux2_klein_workflow_path(workflow_key)
+        try:
+            with open(prompt_path, "r", encoding="utf-8") as file:
+                prompt: dict[str, Any] = json.load(file)
+        except UnicodeDecodeError:
+            with open(prompt_path, "r", encoding="cp1252") as file:
+                prompt = json.load(file)
+    except Exception as err:
+        raise Flux2PreparationError(
+            "Workflow Error",
+            f"Prompt load failed: {err}",
+        ) from err
+
+    selected_images = [image_1]
+    if image_count >= 2:
+        selected_images.append(image_2)
+    if image_count >= 3:
+        selected_images.append(image_3)
+
+    try:
+        pil_images: list[Image.Image] = []
+        for image in selected_images:
+            pil_image = _to_pil_image(image)
+            if pil_image.mode not in ("RGB", "RGBA"):
+                pil_image = pil_image.convert("RGB")
+            pil_images.append(pil_image)
+        input_paths = [
+            _save_temp_image(image, prefix=f"flux2_input_{idx + 1}")
+            for idx, image in enumerate(pil_images)
+        ]
+        image_names = [
+            f"flux2_klein_input_{idx}.jpg"
+            for idx in range(1, len(pil_images) + 1)
+        ]
+        image_payload = [
+            {
+                "name": image_name,
+                "image": save_input_image_as_base64(pil_image),
+            }
+            for image_name, pil_image in zip(image_names, pil_images)
+        ]
+    except Exception as err:
+        raise Flux2PreparationError(
+            "Input Error",
+            f"Image preparation failed: {err}",
+        ) from err
+
+    uses_padding_crop = _has_padding_crop_nodes(prompt)
+    return Flux2PreparedInputs(
+        workflow_key=workflow_key,
+        image_count=image_count,
+        prompt=prompt,
+        pil_images=pil_images,
+        input_paths=input_paths,
+        image_names=image_names,
+        image_payload=image_payload,
+        uses_padding_crop=uses_padding_crop,
+        task_id=str(uuid.uuid4()),
+        feature_flags={
+            "mode": mode,
+            "image_count": image_count,
+            "uses_qwenvl": mode in {MODE_REFERENCE_TRANSFER, MODE_RAW_ENHANCEMENT},
+            "padding_crop": uses_padding_crop,
+            "padding_multiple": 32 if uses_padding_crop else None,
+        },
+        settings_snapshot={
+            "mode": mode,
+            "image_count": image_count,
+            "prompt_text": str(prompt_text or ""),
+            "realistic_strength": float(realistic_strength),
+        },
+    )
+
+
+def _build_flux2_payload(
+    prepared: Flux2PreparedInputs,
+    *,
+    mode: str,
+    prompt_text: str,
+    realistic_strength: float,
+    workflow_debug: bool,
+    is_admin_user: bool,
+) -> Flux2PreparedJob:
+    _apply_flux2_klein_workflow_updates(
+        prepared.prompt,
+        mode=mode,
+        image_count=prepared.image_count,
+        prompt_text=prompt_text,
+        image_names=prepared.image_names,
+        realistic_strength=realistic_strength,
+        workflow=prepared.workflow_key,
+    )
+    payload = prepare_json(prepared.prompt, prepared.image_payload)
+    workflow_debug_path: Path | None = None
+    if os.getenv("SAVE_DEBUG_PROMPT_JSON", "0") == "1" or (
+        workflow_debug and is_admin_user
+    ):
+        try:
+            workflow_debug_path = _save_workflow_debug_json(
+                payload,
+                workflow_name=prepared.workflow_key,
+                task_id=prepared.task_id,
+            )
+        except Exception as err:
+            logger.warning("Could not save debug prompt JSON: %s", err)
+    return Flux2PreparedJob(
+        inputs=prepared,
+        payload=payload,
+        workflow_debug_path=workflow_debug_path,
+    )
+
+
+def _create_flux2_task_tracker(
+    prepared: Flux2PreparedInputs,
+    *,
+    identity: Any,
+    user_agent: str | None,
+    session_id: str,
+    prompt_text: str,
+    realistic_strength: float,
+) -> TaskTracker:
+    return TaskTracker(
+        store=None,
+        task_id=prepared.task_id,
+        user_email=identity.email,
+        user_prefix=identity.username_prefix,
+        user_display_name=identity.display_name,
+        user_role=identity.role,
+        avatar_filename=identity.avatar_filename,
+        workflow=WorkflowContext(
+            key=prepared.workflow_key,
+            name=prepared.workflow_key,
+            version=WORKFLOW_VERSION,
+            category=WORKFLOW_CATEGORY,
+            workflow_type=WORKFLOW_TYPE,
+        ),
+        source_page="/tab/flux2-klein-image-edit-9b-distilled",
+        browser_user_agent=user_agent,
+        session_id=session_id,
+        environment_name=APP_ENVIRONMENT,
+        feature_flags=prepared.feature_flags,
+        settings=prepared.settings_snapshot,
+        input_meta={
+            "width": int(prepared.pil_images[0].width),
+            "height": int(prepared.pil_images[0].height),
+            "resolution": (
+                f"{int(prepared.pil_images[0].width)}"
+                f"x{int(prepared.pil_images[0].height)}"
+            ),
+            "format": str(prepared.pil_images[0].mode),
+            "image_count": prepared.image_count,
+        },
+        request_summary={
+            "mode": prepared.settings_snapshot["mode"],
+            "image_count": prepared.image_count,
+            "prompt_text": str(prompt_text or ""),
+            "realistic_strength": float(realistic_strength),
+        },
+        prompt_type="image_edit",
+        created_by=identity.email,
+    )
+
+
+async def _submit_flux2_job(
+    api: RunpodAPI,
+    payload: dict[str, Any],
+) -> Flux2SubmissionResult:
+    try:
+        response = await api.run(payload)
+        return Flux2SubmissionResult(job_id=str(response["id"]))
+    except RunpodSubmissionUncertainError as err:
+        return Flux2SubmissionResult(
+            job_id=None,
+            error_message=(
+                f"{err}\n\nPlease check the Jobs page before trying again; "
+                "RunPod may already have accepted this request."
+            ),
+            uncertain=True,
+        )
+    except RunpodSubmissionError as err:
+        return Flux2SubmissionResult(
+            job_id=None,
+            error_message=f"Job submission failed: {err}",
+        )
+    except Exception as err:
+        return Flux2SubmissionResult(
+            job_id=None,
+            error_message=f"Job submission failed: {err}",
+        )
+
+
+async def _finalize_flux2_output(
+    status: dict[str, Any],
+    prepared: Flux2PreparedInputs,
+) -> Flux2FinalizedOutput:
+    try:
+        result_image = await _decode_output_image(status)
+        if prepared.uses_padding_crop:
+            result_image = _crop_to_dimensions(
+                result_image,
+                int(prepared.pil_images[0].width),
+                int(prepared.pil_images[0].height),
+            )
+        return Flux2FinalizedOutput(
+            result_image=result_image,
+            left_path=prepared.input_paths[0],
+            right_path=_save_temp_image(result_image, prefix="flux2_output"),
+            artifacts=extract_artifacts_from_status(status),
+        )
+    except Exception as err:
+        return Flux2FinalizedOutput(error_message=str(err))
+
+
+async def _poll_flux2_job(
+    api: RunpodAPI,
+    job_id: str,
+    prepared: Flux2PreparedInputs,
+):
+    for poll_idx in range(MAX_STATUS_POLLS):
+        try:
+            status = await api.status(job_id)
+        except Exception as err:
+            yield Flux2PollEvent(
+                kind="status_error",
+                status={},
+                title="RunPod Error",
+                message=f"Failed to check job status: {err}",
+                progress_percent=0,
+                stage="processing",
+                poll_idx=poll_idx,
+            )
+            return
+
+        state = (status.get("status") or "UNKNOWN").upper()
+        has_final_output = _has_final_output_payload(status)
+        if state in TERMINAL_FAILURES:
+            yield Flux2PollEvent(
+                kind="terminal_failure",
+                status=status,
+                title="RunPod Error",
+                message=_extract_error_message(status),
+                progress_percent=0,
+                stage="processing",
+                poll_idx=poll_idx,
+            )
+            return
+
+        if state == "COMPLETED" or has_final_output:
+            finalized = await _finalize_flux2_output(status, prepared)
+            if finalized.error_message:
+                yield Flux2PollEvent(
+                    kind="decode_error",
+                    status=status,
+                    title="Decode Error",
+                    message=f"Failed to decode image: {finalized.error_message}",
+                    progress_percent=96,
+                    stage="output_collecting",
+                    poll_idx=poll_idx,
+                    finalized=finalized,
+                )
+            else:
+                yield Flux2PollEvent(
+                    kind="completed",
+                    status=status,
+                    title="Image generated",
+                    message="Image generated",
+                    progress_percent=100,
+                    stage="completed",
+                    poll_idx=poll_idx,
+                    finalized=finalized,
+                )
+            return
+
+        runpod_progress, progress_text, _ = _extract_progress_signal(status)
+        title, message, progress_percent = _describe_progress_status(
+            state,
+            progress_text,
+            has_final_output=has_final_output,
+            runpod_progress=runpod_progress,
+        )
+        yield Flux2PollEvent(
+            kind="progress",
+            status=status,
+            title=title,
+            message=message,
+            progress_percent=progress_percent,
+            stage=_processing_stage_name(
+                state,
+                has_final_output=has_final_output,
+            ),
+            poll_idx=poll_idx,
+            runpod_progress=runpod_progress,
+            progress_text=progress_text,
+        )
+        await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
+
+    yield Flux2PollEvent(
+        kind="timeout",
+        status={},
+        title="Timeout",
+        message="Timed out waiting for RunPod completion status.",
+        progress_percent=0,
+        stage="processing",
+        poll_idx=MAX_STATUS_POLLS,
+    )
+
+
+def _record_flux2_poll_event(
+    tracker: TaskTracker,
+    event: Flux2PollEvent,
+    *,
+    mode: str,
+) -> None:
+    if event.kind == "progress":
+        tracker.emit_processing(
+            stage=event.stage,
+            message=event.message,
+            progress_percent=event.progress_percent,
+            node_id=None,
+            metadata={
+                "poll_idx": event.poll_idx,
+                "runpod_state": event.status.get("status"),
+                "mode": mode,
+                "progress_text": event.progress_text,
+                "runpod_progress": event.runpod_progress,
+            },
+        )
+        return
+
+    if event.kind == "completed":
+        finalized = event.finalized
+        if (
+            finalized is None
+            or finalized.result_image is None
+            or finalized.left_path is None
+            or finalized.right_path is None
+        ):
+            raise ValueError("Completed Flux2 event is missing finalized output.")
+        artifacts = finalized.artifacts or {}
+        thumbnail_path = tracker.add_thumbnail(
+            image=finalized.result_image,
+            output_index=0,
+        )
+        preview_path = tracker.add_preview(
+            image=finalized.result_image,
+            output_index=0,
+        )
+        output_filename = (
+            artifacts.get("output_filename")
+            or finalized.right_path.name
+        )
+        tracker.add_output_record(
+            output_index=0,
+            result_url=artifacts.get("result_url"),
+            thumbnail_url=thumbnail_path,
+            preview_url=preview_path,
+            file_name=output_filename,
+            width=finalized.result_image.width,
+            height=finalized.result_image.height,
+        )
+        tracker.complete(
+            result_url=artifacts.get("result_url"),
+            thumbnail_url=thumbnail_path,
+            preview_url=preview_path,
+            output_filename=output_filename,
+            output_count=max(int(artifacts.get("output_count") or 0), 1),
+            output_width=finalized.result_image.width,
+            output_height=finalized.result_image.height,
+            worker_id=artifacts.get("worker_id"),
+            result_summary={
+                "left_path": str(finalized.left_path),
+                "right_path": str(finalized.right_path),
+                "runpod_state": event.status.get("status"),
+                "mode": mode,
+            },
+        )
+        return
+
+    failure_reason = {
+        "status_error": "status_error",
+        "terminal_failure": (
+            f"runpod_{str(event.status.get('status') or 'unknown').lower()}"
+        ),
+        "decode_error": "decode_error",
+        "timeout": "timeout",
+    }.get(event.kind, event.kind)
+    tracker.fail(
+        failure_reason=failure_reason,
+        error_message=event.message,
+        failure_stage=event.stage,
+        progress_percent=event.progress_percent,
+        worker_id=event.status.get("workerId"),
+        metadata=(
+            {"runpod_state": event.status.get("status")}
+            if event.kind == "terminal_failure"
+            else None
+        ),
+    )
+
+
+def _render_flux2_poll_event(
+    event: Flux2PollEvent,
+    *,
+    job_id: str,
+) -> tuple[Any, str, str | None]:
+    if event.kind == "progress":
+        return (
+            gr.update(),
+            _render_status_panel(
+                event.title,
+                event.message,
+                percent=event.progress_percent,
+            ),
+            job_id,
+        )
+    if event.kind == "completed":
+        finalized = event.finalized
+        if (
+            finalized is None
+            or finalized.left_path is None
+            or finalized.right_path is None
+        ):
+            raise ValueError("Completed Flux2 event is missing output paths.")
+        return (
+            (str(finalized.left_path), str(finalized.right_path)),
+            _render_status_panel(event.title, event.message, percent=100),
+            None,
+        )
+    return (
+        gr.update(),
+        _render_status_panel(
+            event.title,
+            event.message,
+            accent="#f87171",
+        ),
+        None,
+    )
+
+
 async def flux2_klein_generate(
     mode: str,
     edit_image_count: str,
@@ -775,7 +1306,6 @@ async def flux2_klein_generate(
 ):
     del job_state
     logger.info("Workflow %s called in mode %s", workflow, mode)
-
     user_email = getattr(request, "username", None)
     if not user_email:
         yield (
@@ -791,309 +1321,118 @@ async def flux2_klein_generate(
 
     identity = auth_service.get_identity(user_email)
     user_role = str(getattr(identity, "role", "") or "").strip().lower()
-    is_admin_user = user_role == "admin"
     user_agent = _request_header(request, "user-agent")
     session_id = auth_service.session_key(identity.email, user_agent)
-    workflow_key = (
-        REALISTIC_WORKFLOW_NAME
-        if mode == MODE_REALISTIC
-        else str(workflow or WORKFLOW_NAME)
-    )
-    source_page = "/tab/flux2-klein-image-edit-9b-distilled"
-    image_count = _effective_image_count(mode, edit_image_count)
-
     try:
-        _validate_mode_inputs(
+        prepared_inputs = _prepare_flux2_inputs(
             mode=mode,
-            image_count=image_count,
+            edit_image_count=edit_image_count,
             image_1=image_1,
             image_2=image_2,
             image_3=image_3,
-        )
-    except Exception as err:
-        yield gr.update(), _render_status_panel("Input Error", str(err), accent="#f87171"), None
-        return
-
-    try:
-        prompt_path = _resolve_flux2_klein_workflow_path(workflow_key)
-        with open(prompt_path, "r", encoding="utf-8") as fh:
-            prompt: dict[str, Any] = json.load(fh)
-    except UnicodeDecodeError:
-        with open(prompt_path, "r", encoding="cp1252") as fh:
-            prompt = json.load(fh)
-    except Exception as err:
-        yield gr.update(), _render_status_panel("Workflow Error", f"Prompt load failed: {err}", accent="#f87171"), None
-        return
-    uses_padding_crop = _has_padding_crop_nodes(prompt)
-
-    selected_images = [image_1]
-    if image_count >= 2:
-        selected_images.append(image_2)
-    if image_count >= 3:
-        selected_images.append(image_3)
-
-    try:
-        pil_images = []
-        for image in selected_images:
-            pil_image = _to_pil_image(image)
-            if pil_image.mode not in ("RGB", "RGBA"):
-                pil_image = pil_image.convert("RGB")
-            pil_images.append(pil_image)
-    except Exception as err:
-        yield gr.update(), _render_status_panel("Input Error", f"Image preparation failed: {err}", accent="#f87171"), None
-        return
-
-    input_paths = [_save_temp_image(image, prefix=f"flux2_input_{idx + 1}") for idx, image in enumerate(pil_images)]
-    image_names: list[str] = []
-    image_payload: list[dict[str, Any]] = []
-    for idx, pil_image in enumerate(pil_images, start=1):
-        image_name = f"flux2_klein_input_{idx}.jpg"
-        image_names.append(image_name)
-        image_payload.append({"name": image_name, "image": save_input_image_as_base64(pil_image)})
-
-    feature_flags = {
-        "mode": mode,
-        "image_count": image_count,
-        "uses_qwenvl": mode in {MODE_REFERENCE_TRANSFER, MODE_RAW_ENHANCEMENT},
-        "padding_crop": uses_padding_crop,
-        "padding_multiple": 32 if uses_padding_crop else None,
-    }
-    settings_snapshot = {
-        "mode": mode,
-        "image_count": image_count,
-        "prompt_text": str(prompt_text or ""),
-        "realistic_strength": float(realistic_strength),
-    }
-    task_id = str(uuid.uuid4())
-    workflow_context = WorkflowContext(
-        key=workflow_key,
-        name=workflow_key,
-        version=WORKFLOW_VERSION,
-        category=WORKFLOW_CATEGORY,
-        workflow_type=WORKFLOW_TYPE,
-    )
-    tracker = TaskTracker(
-        store=None,
-        task_id=task_id,
-        user_email=identity.email,
-        user_prefix=identity.username_prefix,
-        user_display_name=identity.display_name,
-        user_role=identity.role,
-        avatar_filename=identity.avatar_filename,
-        workflow=workflow_context,
-        source_page=source_page,
-        browser_user_agent=user_agent,
-        session_id=session_id,
-        environment_name=APP_ENVIRONMENT,
-        feature_flags=feature_flags,
-        settings=settings_snapshot,
-        input_meta={
-            "width": int(pil_images[0].width),
-            "height": int(pil_images[0].height),
-            "resolution": f"{int(pil_images[0].width)}x{int(pil_images[0].height)}",
-            "format": str(pil_images[0].mode),
-            "image_count": image_count,
-        },
-        request_summary={
-            "mode": mode,
-            "image_count": image_count,
-            "prompt_text": str(prompt_text or ""),
-            "realistic_strength": float(realistic_strength),
-        },
-        prompt_type="image_edit",
-        created_by=identity.email,
-    )
-
-    try:
-        _apply_flux2_klein_workflow_updates(
-            prompt,
-            mode=mode,
-            image_count=image_count,
             prompt_text=prompt_text,
-            image_names=image_names,
             realistic_strength=realistic_strength,
-            workflow=workflow_key,
+            workflow=workflow,
         )
-    except KeyError as err:
-        tracker.fail(
-            failure_reason="workflow_key_missing",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
+    except Flux2PreparationError as err:
+        yield (
+            gr.update(),
+            _render_status_panel(err.title, str(err), accent="#f87171"),
+            None,
         )
-        yield gr.update(), _render_status_panel("Workflow Error", f"Workflow key missing: {err}", accent="#f87171"), None
-        return
-    except Exception as err:
-        tracker.fail(
-            failure_reason="workflow_update_error",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
-        yield gr.update(), _render_status_panel("Workflow Error", f"Workflow update failed: {err}", accent="#f87171"), None
         return
 
-    final_json = prepare_json(prompt, image_payload)
-    workflow_debug_path: Path | None = None
-    should_save_debug_json = bool(
-        os.getenv("SAVE_DEBUG_PROMPT_JSON", "0") == "1"
-        or (workflow_debug and is_admin_user)
+    tracker = _create_flux2_task_tracker(
+        prepared_inputs,
+        identity=identity,
+        user_agent=user_agent,
+        session_id=session_id,
+        prompt_text=prompt_text,
+        realistic_strength=realistic_strength,
     )
-    if should_save_debug_json:
-        try:
-            workflow_debug_path = _save_workflow_debug_json(
-                final_json,
-                workflow_name=workflow_key,
-                task_id=task_id,
-            )
-        except Exception as err:
-            logger.warning("Could not save debug prompt JSON: %s", err)
+    try:
+        prepared_job = _build_flux2_payload(
+            prepared_inputs,
+            mode=mode,
+            prompt_text=prompt_text,
+            realistic_strength=realistic_strength,
+            workflow_debug=workflow_debug,
+            is_admin_user=user_role == "admin",
+        )
+    except Exception as err:
+        title = "Workflow Error"
+        message = (
+            f"Workflow key missing: {err}"
+            if isinstance(err, KeyError)
+            else f"Workflow update failed: {err}"
+        )
+        tracker.fail(
+            failure_reason=(
+                "workflow_key_missing"
+                if isinstance(err, KeyError)
+                else "workflow_update_error"
+            ),
+            error_message=str(err),
+            failure_stage="preparation",
+            progress_percent=0,
+            worker_id=None,
+        )
+        yield gr.update(), _render_status_panel(title, message, accent="#f87171"), None
+        return
 
     api = RunpodAPI(environment=RUNPOD_ENVIRONMENT)
-    try:
-        run_resp = await api.run(final_json)
-        job_id = run_resp["id"]
-    except Exception as err:
+    submission = await _submit_flux2_job(api, prepared_job.payload)
+    if submission.job_id is None:
         tracker.fail(
-            failure_reason="submission_error",
-            error_message=str(err),
+            failure_reason=(
+                "submission_uncertain"
+                if submission.uncertain
+                else "submission_error"
+            ),
+            error_message=str(submission.error_message or "Submission failed."),
             failure_stage="created",
             progress_percent=0,
             worker_id=None,
         )
-        yield gr.update(), _render_status_panel("RunPod Error", f"Job submission failed: {err}", accent="#f87171"), None
+        yield (
+            gr.update(),
+            _render_status_panel(
+                "RunPod Submission Uncertain"
+                if submission.uncertain
+                else "RunPod Error",
+                str(submission.error_message or "Job submission failed."),
+                accent="#f59e0b" if submission.uncertain else "#f87171",
+            ),
+            None,
+        )
         return
 
+    job_id = submission.job_id
     tracker.attach_request(
         request_id=job_id,
         task_url=f"{api.base_url}/status/{job_id}",
         retry_count=0,
     )
-
     submitted_message = "Preparing image"
-    if workflow_debug_path is not None:
-        submitted_message += f"\n\nDebug JSON saved: {workflow_debug_path}"
-    yield gr.update(), _render_status_panel("Preparing image", submitted_message, percent=3), job_id
-
-    for poll_idx in range(MAX_STATUS_POLLS):
-        try:
-            status = await api.status(job_id)
-        except Exception as err:
-            tracker.fail(
-                failure_reason="status_error",
-                error_message=str(err),
-                failure_stage="processing",
-                progress_percent=0,
-                worker_id=None,
-            )
-            yield gr.update(), _render_status_panel("RunPod Error", f"Failed to check job status: {err}", accent="#f87171"), None
-            return
-
-        state = (status.get("status") or "UNKNOWN").upper()
-        has_final_output = _has_final_output_payload(status)
-
-        if state in TERMINAL_FAILURES:
-            error_message = _extract_error_message(status)
-            tracker.fail(
-                failure_reason=f"runpod_{state.lower()}",
-                error_message=error_message,
-                failure_stage="processing",
-                progress_percent=0,
-                worker_id=status.get("workerId"),
-                metadata={"runpod_state": state},
-            )
-            yield gr.update(), _render_status_panel("RunPod Error", error_message, accent="#f87171"), None
-            return
-
-        if state == "COMPLETED" or has_final_output:
-            try:
-                result_image = await _decode_output_image(status)
-                if uses_padding_crop:
-                    result_image = _crop_to_dimensions(
-                        result_image,
-                        int(pil_images[0].width),
-                        int(pil_images[0].height),
-                    )
-            except Exception as err:
-                tracker.fail(
-                    failure_reason="decode_error",
-                    error_message=str(err),
-                    failure_stage="output_collecting",
-                    progress_percent=96,
-                    worker_id=status.get("workerId"),
-                )
-                yield gr.update(), _render_status_panel("Decode Error", f"Failed to decode image: {err}", accent="#f87171"), None
-                return
-
-            left_path = input_paths[0]
-            right_path = _save_temp_image(result_image, prefix="flux2_output")
-            artifacts = extract_artifacts_from_status(status)
-            thumbnail_path = tracker.add_thumbnail(image=result_image, output_index=0)
-            preview_path = tracker.add_preview(image=result_image, output_index=0)
-            tracker.add_output_record(
-                output_index=0,
-                result_url=artifacts.get("result_url"),
-                thumbnail_url=thumbnail_path,
-                preview_url=preview_path,
-                file_name=artifacts.get("output_filename") or right_path.name,
-                width=result_image.width,
-                height=result_image.height,
-            )
-            tracker.complete(
-                result_url=artifacts.get("result_url"),
-                thumbnail_url=thumbnail_path,
-                preview_url=preview_path,
-                output_filename=artifacts.get("output_filename") or right_path.name,
-                output_count=max(int(artifacts.get("output_count") or 0), 1),
-                output_width=result_image.width,
-                output_height=result_image.height,
-                worker_id=artifacts.get("worker_id"),
-                result_summary={
-                    "left_path": str(left_path),
-                    "right_path": str(right_path),
-                    "runpod_state": state,
-                    "mode": mode,
-                },
-            )
-            yield (str(left_path), str(right_path)), _render_status_panel("Image generated", "Image generated", percent=100), None
-            return
-
-        runpod_progress, progress_text, _ = _extract_progress_signal(status)
-        current_progress_text = progress_text
-        title, message, progress_percent = _describe_progress_status(
-            state,
-            current_progress_text,
-            has_final_output=has_final_output,
-            runpod_progress=runpod_progress,
+    if prepared_job.workflow_debug_path is not None:
+        submitted_message += (
+            f"\n\nDebug JSON saved: {prepared_job.workflow_debug_path}"
         )
-        status_panel = _render_status_panel(title, message, percent=progress_percent)
-
-        tracker.emit_processing(
-            stage=_processing_stage_name(state, has_final_output=has_final_output),
-            message=message,
-            progress_percent=progress_percent,
-            node_id=None,
-            metadata={
-                "poll_idx": poll_idx,
-                "runpod_state": state,
-                "mode": mode,
-                "progress_text": current_progress_text,
-                "runpod_progress": runpod_progress,
-            },
-        )
-        yield gr.update(), status_panel, job_id
-        await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
-
-    tracker.fail(
-        failure_reason="timeout",
-        error_message="Timed out waiting for RunPod completion status.",
-        failure_stage="processing",
-        progress_percent=0,
-        worker_id=None,
+    yield (
+        gr.update(),
+        _render_status_panel(
+            "Preparing image",
+            submitted_message,
+            percent=3,
+        ),
+        job_id,
     )
-    yield gr.update(), _render_status_panel("Timeout", "Timed out waiting for RunPod completion status.", accent="#f87171"), None
+
+    async for event in _poll_flux2_job(api, job_id, prepared_inputs):
+        _record_flux2_poll_event(tracker, event, mode=mode)
+        yield _render_flux2_poll_event(event, job_id=job_id)
+        if event.kind != "progress":
+            return
 
 
 async def cancel_job(job_id: str | None) -> str:
