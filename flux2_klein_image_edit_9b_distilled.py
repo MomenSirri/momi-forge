@@ -9,7 +9,6 @@ import random
 import re
 import tempfile
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +32,11 @@ from utils import (
     prepare_json,
     save_input_image_as_base64,
 )
+from workflow_ui import (
+    debug_checkbox_visibility_update as _debug_checkbox_visibility_update,
+    request_header as _request_header,
+    save_workflow_debug_json,
+)
 
 _app_log_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, _app_log_level, logging.INFO))
@@ -50,6 +54,14 @@ WORKFLOW_FILE = os.getenv(
     "FLUX2_KLEIN_WORKFLOW_FILE",
     f"{WORKFLOW_NAME}.json",
 )
+REALISTIC_WORKFLOW_NAME = os.getenv(
+    "FLUX2_KLEIN_REALISTIC_WORKFLOW_NAME",
+    "flux2_klein_realistic",
+)
+REALISTIC_WORKFLOW_FILE = os.getenv(
+    "FLUX2_KLEIN_REALISTIC_WORKFLOW_FILE",
+    f"{REALISTIC_WORKFLOW_NAME}.json",
+)
 WORKFLOW_VERSION = os.getenv("WORKFLOW_VERSION_FLUX2_KLEIN", "distilled")
 WORKFLOW_CATEGORY = os.getenv("WORKFLOW_CATEGORY_FLUX2_KLEIN", "image_edit")
 WORKFLOW_TYPE = os.getenv("WORKFLOW_TYPE_FLUX2_KLEIN", "image")
@@ -62,29 +74,33 @@ RUNPOD_STATUS_POLL_INTERVAL_S = max(
     float(os.getenv("RUNPOD_STATUS_POLL_INTERVAL_S", "0.4")),
 )
 MAX_STATUS_POLLS = int(os.getenv("RUNPOD_MAX_STATUS_POLLS", "1800"))
-WORKFLOW_DEBUG_JSON_DIR = Path(
+PROMPT_LIBRARY_PATH = Path(
     os.getenv(
-        "WORKFLOW_DEBUG_JSON_DIR",
-        str(Path(__file__).resolve().parent / "trace_logs" / "workflow_debug"),
+        "FLUX2_KLEIN_PROMPT_LIBRARY_PATH",
+        str(Path(__file__).resolve().parent / "prompt_library.json"),
     )
 )
+PROMPT_LIBRARY_ALL_CATEGORY = "all"
 
 TERMINAL_FAILURES = {"FAILED", "ERROR", "TIMED_OUT", "CANCELLED"}
 MODE_EDIT = "Edit"
 MODE_REFERENCE_TRANSFER = "Reference Transfer"
 MODE_CONSISTENCY = "Consistency"
 MODE_RAW_ENHANCEMENT = "Raw Enhancement"
+MODE_REALISTIC = "Realistic"
 MODE_CHOICES = [
     MODE_EDIT,
     MODE_REFERENCE_TRANSFER,
     MODE_CONSISTENCY,
     MODE_RAW_ENHANCEMENT,
+    MODE_REALISTIC,
 ]
 IMAGE_COUNT_CHOICES = ["1", "2", "3"]
 MODE_TO_FIXED_IMAGE_COUNT = {
     MODE_REFERENCE_TRANSFER: 2,
     MODE_CONSISTENCY: 1,
     MODE_RAW_ENHANCEMENT: 1,
+    MODE_REALISTIC: 1,
 }
 MODE_TO_LORA = {
     MODE_REFERENCE_TRANSFER: "Klein_ref_transfer_02.safetensors",
@@ -118,6 +134,11 @@ NODE_PADDED_IMAGE_3 = "180"
 NODE_FINAL_CROP = "182"
 NODE_SAVE_IMAGE = "137"
 NODE_VAE_DECODE = "140"
+
+REALISTIC_NODE_IMAGE = "76"
+REALISTIC_NODE_POSITIVE_TEXT = "163"
+REALISTIC_NODE_NOISE = "176"
+REALISTIC_NODE_LORA = "179"
 
 SAMPLER_PROGRESS_PATTERN = re.compile(r"node=(?P<node>[^ ]+)\s+(?P<done>\d+)/(?P<total>\d+)")
 FRACTION_PATTERN = re.compile(r"(?P<done>\d+)/(?P<total>\d+)")
@@ -208,6 +229,9 @@ It usually works well for simple improvements such as color, lighting, adding de
     MODE_RAW_ENHANCEMENT: """**Raw Enhancement**
 
 This mode helps improve your raw render in terms of color and detail. It aims to make the image as realistic as possible.""",
+    MODE_REALISTIC: """**Realistic**
+
+Use one image and describe the desired realistic result in the prompt. Adjust **Realistic Mode** to control the strength of the realism LoRA.""",
 }
 
 BOTTOM_PROGRESS_LAYOUT_CSS = """
@@ -221,27 +245,103 @@ BOTTOM_PROGRESS_LAYOUT_CSS = """
 }
 """
 
-auth_service = get_auth_service()
+
+def _load_prompt_library(path: Path) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    with open(path, "r", encoding="utf-8") as prompt_library_file:
+        payload = json.load(prompt_library_file)
+
+    raw_categories = payload.get("categories") if isinstance(payload, dict) else None
+    raw_presets = payload.get("presets") if isinstance(payload, dict) else None
+    if not isinstance(raw_categories, list) or not isinstance(raw_presets, list):
+        raise ValueError("Prompt library JSON must contain 'categories' and 'presets' lists.")
+
+    categories: list[dict[str, str]] = []
+    category_ids: set[str] = set()
+    for raw_category in raw_categories:
+        if not isinstance(raw_category, dict):
+            raise ValueError("Every prompt library category must be an object.")
+        category_id = str(raw_category.get("id") or "").strip()
+        category_title = str(raw_category.get("title") or "").strip()
+        if not category_id or not category_title:
+            raise ValueError("Prompt library categories require non-empty 'id' and 'title' fields.")
+        if category_id in category_ids:
+            raise ValueError(f"Duplicate prompt library category id: {category_id}")
+        category_ids.add(category_id)
+        categories.append({"id": category_id, "title": category_title})
+
+    presets: list[dict[str, Any]] = []
+    preset_ids: set[str] = set()
+    required_fields = ("id", "title", "category", "description", "prompt")
+    for raw_preset in raw_presets:
+        if not isinstance(raw_preset, dict):
+            raise ValueError("Every prompt library preset must be an object.")
+        preset = {field: str(raw_preset.get(field) or "").strip() for field in required_fields}
+        missing_fields = [field for field in required_fields if not preset[field]]
+        if missing_fields:
+            raise ValueError(
+                f"Prompt library preset is missing required fields: {', '.join(missing_fields)}"
+            )
+        if preset["id"] in preset_ids:
+            raise ValueError(f"Duplicate prompt library preset id: {preset['id']}")
+        if preset["category"] not in category_ids:
+            raise ValueError(
+                f"Prompt library preset '{preset['id']}' uses unknown category "
+                f"'{preset['category']}'."
+            )
+        raw_tags = raw_preset.get("tags") or []
+        if not isinstance(raw_tags, list):
+            raise ValueError(f"Prompt library preset '{preset['id']}' tags must be a list.")
+        preset["tags"] = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+        preset_ids.add(preset["id"])
+        presets.append(preset)
+
+    category_order = {category["id"]: index for index, category in enumerate(categories)}
+    presets.sort(key=lambda preset: (category_order[preset["category"]], preset["title"].casefold()))
+    return categories, presets
 
 
-def _request_header(request: gr.Request, key: str) -> str | None:
-    headers = getattr(request, "headers", None) or {}
-    return headers.get(key) or headers.get(key.lower()) or headers.get(key.title())
+PROMPT_LIBRARY_CATEGORIES, PROMPT_LIBRARY_PRESETS = _load_prompt_library(PROMPT_LIBRARY_PATH)
+PROMPT_LIBRARY_CATEGORY_CHOICES = [
+    ("All Categories", PROMPT_LIBRARY_ALL_CATEGORY),
+    *((category["title"], category["id"]) for category in PROMPT_LIBRARY_CATEGORIES),
+]
+PROMPT_LIBRARY_PRESETS_BY_ID = {
+    preset["id"]: preset for preset in PROMPT_LIBRARY_PRESETS
+}
+PROMPT_LIBRARY_PRESET_CHOICES = [
+    (preset["title"], preset["id"]) for preset in PROMPT_LIBRARY_PRESETS
+]
 
 
-def _is_admin_identity(email: str | None) -> bool:
-    normalized_email = (email or "").strip()
-    if not normalized_email:
-        return False
-    identity = auth_service.get_identity(normalized_email)
-    return str(getattr(identity, "role", "") or "").strip().lower() == "admin"
+def _prompt_library_presets_for_category(category_id: str) -> list[dict[str, Any]]:
+    normalized_category = str(category_id or PROMPT_LIBRARY_ALL_CATEGORY).strip()
+    return [
+        preset
+        for preset in PROMPT_LIBRARY_PRESETS
+        if (
+            normalized_category == PROMPT_LIBRARY_ALL_CATEGORY
+            or preset["category"] == normalized_category
+        )
+    ]
 
 
-def _debug_checkbox_visibility_update(request: gr.Request):
-    return gr.update(
-        visible=_is_admin_identity(getattr(request, "username", None)),
-        value=False,
+def _prompt_library_category_update(category_id: str):
+    matches = _prompt_library_presets_for_category(category_id)
+    selected_preset = matches[0] if matches else None
+    return (
+        gr.update(
+            choices=[(preset["title"], preset["id"]) for preset in matches],
+            value=selected_preset["id"] if selected_preset else None,
+        ),
+        selected_preset["prompt"] if selected_preset else "",
     )
+
+
+def _apply_prompt_library_preset(preset_id: str | None):
+    preset = PROMPT_LIBRARY_PRESETS_BY_ID.get(str(preset_id or ""))
+    return preset["prompt"] if preset is not None else ""
+
+auth_service = get_auth_service()
 
 
 def _save_workflow_debug_json(
@@ -250,30 +350,28 @@ def _save_workflow_debug_json(
     workflow_name: str,
     task_id: str,
 ) -> Path:
-    workflow_payload: Any = payload
-    if isinstance(payload, dict):
-        input_payload = payload.get("input")
-        if isinstance(input_payload, dict) and isinstance(input_payload.get("workflow"), dict):
-            workflow_payload = input_payload["workflow"]
-
-    WORKFLOW_DEBUG_JSON_DIR.mkdir(parents=True, exist_ok=True)
-    safe_workflow = re.sub(r"[^a-zA-Z0-9_-]+", "_", workflow_name).strip("_") or "workflow"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_path = WORKFLOW_DEBUG_JSON_DIR / f"flux2_klein_{safe_workflow}_{task_id}_{timestamp}.json"
-    with open(debug_path, "w", encoding="utf-8") as outfile:
-        json.dump(workflow_payload, outfile, indent=2)
-    return debug_path
+    return save_workflow_debug_json(
+        payload,
+        workflow_name=workflow_name,
+        task_id=task_id,
+        prefix="flux2_klein",
+    )
 
 
 def _resolve_flux2_klein_workflow_path(workflow: str | None = None) -> Path:
-    del workflow
-    configured_path = os.getenv("FLUX2_KLEIN_WORKFLOW_PATH", "").strip()
+    is_realistic_workflow = workflow == REALISTIC_WORKFLOW_NAME
+    configured_path_env = (
+        "FLUX2_KLEIN_REALISTIC_WORKFLOW_PATH"
+        if is_realistic_workflow
+        else "FLUX2_KLEIN_WORKFLOW_PATH"
+    )
+    configured_path = os.getenv(configured_path_env, "").strip()
     if configured_path:
         path = Path(configured_path)
         if path.exists():
             return path
 
-    workflow_file = WORKFLOW_FILE
+    workflow_file = REALISTIC_WORKFLOW_FILE if is_realistic_workflow else WORKFLOW_FILE
     script_dir = Path(__file__).resolve().parent
     candidates = [
         script_dir / "api_workflow" / workflow_file,
@@ -567,8 +665,19 @@ def _apply_flux2_klein_workflow_updates(
     image_count: int,
     prompt_text: str,
     image_names: list[str],
+    realistic_strength: float = 0.5,
     workflow: str | None = None,
 ) -> None:
+    if mode == MODE_REALISTIC:
+        prompt[REALISTIC_NODE_IMAGE]["inputs"]["image"] = image_names[0]
+        prompt[REALISTIC_NODE_POSITIVE_TEXT]["inputs"]["text"] = str(prompt_text or "").strip()
+        prompt[REALISTIC_NODE_NOISE]["inputs"]["noise_seed"] = random.randint(0, 999_999_999_999)
+        prompt[REALISTIC_NODE_LORA]["inputs"]["strength_model"] = max(
+            0.0,
+            min(float(realistic_strength), 1.0),
+        )
+        return
+
     prompt[NODE_IMAGE_1]["inputs"]["image"] = image_names[0]
     if len(image_names) > 1:
         prompt[NODE_IMAGE_2]["inputs"]["image"] = image_names[1]
@@ -634,6 +743,7 @@ def _mode_controls_update(mode: str, image_count: str | int | None):
     return (
         gr.update(visible=mode == MODE_EDIT, value=str(effective_count)),
         gr.update(visible=mode != MODE_REFERENCE_TRANSFER),
+        gr.update(visible=mode == MODE_REALISTIC),
         gr.update(visible=True),
         gr.update(visible=effective_count >= 2),
         gr.update(visible=effective_count >= 3),
@@ -657,6 +767,7 @@ async def flux2_klein_generate(
     image_2: Any,
     image_3: Any,
     prompt_text: str,
+    realistic_strength: float,
     workflow_debug: bool,
     job_state: str | None,
     workflow: str,
@@ -683,7 +794,11 @@ async def flux2_klein_generate(
     is_admin_user = user_role == "admin"
     user_agent = _request_header(request, "user-agent")
     session_id = auth_service.session_key(identity.email, user_agent)
-    workflow_key = str(workflow or WORKFLOW_NAME)
+    workflow_key = (
+        REALISTIC_WORKFLOW_NAME
+        if mode == MODE_REALISTIC
+        else str(workflow or WORKFLOW_NAME)
+    )
     source_page = "/tab/flux2-klein-image-edit-9b-distilled"
     image_count = _effective_image_count(mode, edit_image_count)
 
@@ -747,6 +862,7 @@ async def flux2_klein_generate(
         "mode": mode,
         "image_count": image_count,
         "prompt_text": str(prompt_text or ""),
+        "realistic_strength": float(realistic_strength),
     }
     task_id = str(uuid.uuid4())
     workflow_context = WorkflowContext(
@@ -782,6 +898,7 @@ async def flux2_klein_generate(
             "mode": mode,
             "image_count": image_count,
             "prompt_text": str(prompt_text or ""),
+            "realistic_strength": float(realistic_strength),
         },
         prompt_type="image_edit",
         created_by=identity.email,
@@ -794,6 +911,7 @@ async def flux2_klein_generate(
             image_count=image_count,
             prompt_text=prompt_text,
             image_names=image_names,
+            realistic_strength=realistic_strength,
             workflow=workflow_key,
         )
     except KeyError as err:
@@ -827,7 +945,7 @@ async def flux2_klein_generate(
         try:
             workflow_debug_path = _save_workflow_debug_json(
                 final_json,
-                workflow_name=str(workflow or WORKFLOW_NAME),
+                workflow_name=workflow_key,
                 task_id=task_id,
             )
         except Exception as err:
@@ -1014,11 +1132,36 @@ def _build_flux2_klein_interface(
                     label="Image Count",
                     info="Only used in Edit mode.",
                 )
-                prompt_input = gr.Textbox(
-                    label="Prompt",
-                    placeholder="Describe the edit or target result...",
-                    lines=5,
-                )
+                with gr.Row():
+                    prompt_input = gr.Textbox(
+                        label="Prompt",
+                        placeholder="Describe the edit or target result...",
+                        lines=5,
+                        scale=3,
+                    )
+                    with gr.Column(
+                        scale=2,
+                        min_width=190,
+                        visible=False,
+                    ) as realistic_controls_column:
+                        prompt_library_category = gr.Dropdown(
+                            choices=PROMPT_LIBRARY_CATEGORY_CHOICES,
+                            value=PROMPT_LIBRARY_ALL_CATEGORY,
+                            label="Category",
+                        )
+                        prompt_library_preset = gr.Dropdown(
+                            choices=PROMPT_LIBRARY_PRESET_CHOICES,
+                            value=PROMPT_LIBRARY_PRESETS[0]["id"],
+                            label="Preset",
+                        )
+                        realistic_strength_slider = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.5,
+                            step=0.05,
+                            label="Realistic Mode",
+                            info="Controls the realistic LoRA strength.",
+                        )
                 mode_hint = gr.Markdown(MODE_HINTS[MODE_EDIT])
                 workflow_debug_checkbox = gr.Checkbox(
                     label="Workflow Debug (Admin only)",
@@ -1048,6 +1191,7 @@ def _build_flux2_klein_interface(
             outputs=[
                 image_count_dropdown,
                 prompt_input,
+                realistic_controls_column,
                 image_input_1,
                 image_input_2,
                 image_input_3,
@@ -1058,6 +1202,21 @@ def _build_flux2_klein_interface(
             fn=_edit_count_update,
             inputs=[mode_dropdown, image_count_dropdown],
             outputs=[image_input_1, image_input_2, image_input_3],
+        )
+
+        prompt_library_category.change(
+            fn=_prompt_library_category_update,
+            inputs=prompt_library_category,
+            outputs=[prompt_library_preset, prompt_input],
+            queue=False,
+            show_progress="hidden",
+        )
+        prompt_library_preset.change(
+            fn=_apply_prompt_library_preset,
+            inputs=prompt_library_preset,
+            outputs=prompt_input,
+            queue=False,
+            show_progress="hidden",
         )
 
         generate_event = generate_btn.click(
@@ -1076,6 +1235,7 @@ def _build_flux2_klein_interface(
                 image_input_2,
                 image_input_3,
                 prompt_input,
+                realistic_strength_slider,
                 workflow_debug_checkbox,
                 job_id_state,
                 workflow_name,

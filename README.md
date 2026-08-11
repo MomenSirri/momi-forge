@@ -98,18 +98,39 @@ Example:
 RUNPOD_API_KEY=your_runpod_api_key
 RUNPOD_POD_ID_SEED=your_serverless_endpoint_id
 RUNPOD_TARGET_ENV=SEED
+RUNPOD_RUN_CONNECT_ATTEMPTS=3
 RUNPOD_MANAGEMENT_URL=/runpod-management
 RUNPOD_MANAGEMENT_DIST_DIR=D:\runpod_mangment\pythonProject\webapp\frontend\dist
 RUNPOD_MANAGEMENT_API_UPSTREAM_URL=https://127.0.0.1:8843
+HISTORY_PORTAL_SSO_SECRET=generate_a_long_random_value
+RUNPOD_BILLING_EMAILS=owner@brickvisual.com
 USER_DB_PATH=users.db
 MOMI_WORKFLOW_FILE=Seedvr_flux_upscaler_03.json
 SAVE_DEBUG_PROMPT_JSON=0
 ```
 
+### Required: `HISTORY_PORTAL_SSO_SECRET`
+
+`/history-proxy` and `/runpod-management` are FastAPI routes mounted next to the
+Gradio app, so Gradio's login does **not** cover them. Both authorize each
+request with an HMAC signed token, and this secret is the signing key.
+
+The app, the history portal, and the RunPod management service all refuse to
+start without it. Generate one and put it in `.env`:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+All three processes must use the same value. The launchers read it from `.env`
+and export it to the Node services, which do not read `.env` themselves.
+
 ### Notes
 
 - `RUNPOD_TARGET_ENV=SEED` means the app will use `RUNPOD_POD_ID_SEED`.
 - The RunPod ID here should be your **serverless endpoint ID**.
+- `RUNPOD_BILLING_EMAILS` is the comma-separated allowlist for the RunPod Spend tab.
+- `RUNPOD_RUN_CONNECT_ATTEMPTS` controls safe job-submission retries when the connection fails before the request can reach RunPod. Failures after transmission are not retried automatically because they could create duplicate billable jobs.
 - `RUNPOD_MANAGEMENT_URL` controls the admin/ex RunPod Management iframe inside Admin Analytics.
 - The default `/runpod-management` path serves RunPod Management through the Momi Forge port, so users do not need direct access to ports `5173` or `8843`.
 - `users.db` is created automatically if it does not exist.
@@ -197,11 +218,13 @@ This launches:
 The launcher also sets:
 - `USER_DB_PATH`
 - `HISTORY_PORTAL_URL`
-- `HISTORY_PORTAL_SSO_SECRET`
 
-so the History iframe can auto sign-in from your existing Gradio session.
+and reads `HISTORY_PORTAL_SSO_SECRET` from `.env`, exporting it to the Node
+services so the History iframe can auto sign-in from your existing Gradio
+session. The launcher stops with an error if that secret is missing.
 
-If you run manually (without the `.bat`), set the same `HISTORY_PORTAL_SSO_SECRET` value for both processes, otherwise the history portal will ask for a second login.
+If you run the processes manually, set the same `HISTORY_PORTAL_SSO_SECRET` for
+all of them, otherwise the history portal rejects the proxied requests.
 ```
 
 If not found, the app falls back to `bricker_image/default_avatar.png`.
@@ -327,6 +350,18 @@ HISTORY_PORTAL_URL=http://127.0.0.1:8199
 - `GET /api/favorite-categories`
 - `POST /api/favorite-categories`
 - `GET /api/asset?path=...`
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -t .
+```
+
+Covered today:
+- `tests/test_runpod_api_class.py` — submission retry safety (no duplicate billable jobs)
+- `tests/test_portal_auth.py` — token signing, expiry, and packing primitives
+- `tests/test_app_authorization.py` — role gating and the history / RunPod management proxy gates
+- `tests/test_workflow_ui.py` — helpers shared by the four workflow tabs
 
 ## Error handling
 

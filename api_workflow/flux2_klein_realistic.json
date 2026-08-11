@@ -1,0 +1,370 @@
+{
+  "76": {
+    "inputs": {
+      "image": "0 (1).jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "160": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "181",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "161": {
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "162": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "163": {
+    "inputs": {
+      "text": "reportage photography, Twilight blue hour, balanced exposure preserving sky detail while interior glows warmly. Serene, intimate feeling—cozy amber light contrasting cool dusk tones. Moderate brightness, gentle highlights, tranquil reflective calmness, inviting warmth against dimming daylight.",
+      "clip": [
+        "161",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "164": {
+    "inputs": {
+      "conditioning": [
+        "163",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    }
+  },
+  "165": {
+    "inputs": {
+      "image": [
+        "184",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "166": {
+    "inputs": {
+      "conditioning": [
+        "163",
+        0
+      ],
+      "latent": [
+        "174",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "167": {
+    "inputs": {
+      "conditioning": [
+        "164",
+        0
+      ],
+      "latent": [
+        "174",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "ReferenceLatent"
+    }
+  },
+  "168": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "169": {
+    "inputs": {
+      "steps": 4,
+      "width": [
+        "165",
+        0
+      ],
+      "height": [
+        "165",
+        1
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2Scheduler"
+    }
+  },
+  "170": {
+    "inputs": {
+      "width": [
+        "165",
+        0
+      ],
+      "height": [
+        "165",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": {
+      "title": "Empty Flux 2 Latent"
+    }
+  },
+  "171": {
+    "inputs": {
+      "noise": [
+        "176",
+        0
+      ],
+      "guider": [
+        "173",
+        0
+      ],
+      "sampler": [
+        "168",
+        0
+      ],
+      "sigmas": [
+        "169",
+        0
+      ],
+      "latent_image": [
+        "170",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "172": {
+    "inputs": {
+      "samples": [
+        "171",
+        0
+      ],
+      "vae": [
+        "162",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "173": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "179",
+        0
+      ],
+      "positive": [
+        "166",
+        0
+      ],
+      "negative": [
+        "167",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFGGuider"
+    }
+  },
+  "174": {
+    "inputs": {
+      "pixels": [
+        "184",
+        0
+      ],
+      "vae": [
+        "162",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "175": {
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "176": {
+    "inputs": {
+      "noise_seed": 888523047822340
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "179": {
+    "inputs": {
+      "lora_name": "realistic.safetensors",
+      "strength_model": 0.5,
+      "model": [
+        "175",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderBypassModelOnly",
+    "_meta": {
+      "title": "Load LoRA (Bypass, Model Only) (for debugging)"
+    }
+  },
+  "180": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "181",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "181": {
+    "inputs": {
+      "width": [
+        "185",
+        0
+      ],
+      "height": [
+        "185",
+        1
+      ],
+      "interpolation": "lanczos",
+      "method": "fill / crop",
+      "condition": "always",
+      "multiple_of": 1,
+      "image": [
+        "172",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "182": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "megapixels": 1,
+      "resolution_steps": 1,
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "183": {
+    "inputs": {
+      "image": [
+        "182",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "184": {
+    "inputs": {
+      "width": [
+        "183",
+        0
+      ],
+      "height": [
+        "183",
+        1
+      ],
+      "interpolation": "lanczos",
+      "method": "pad",
+      "condition": "always",
+      "multiple_of": 32,
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "ImageResize+",
+    "_meta": {
+      "title": "🔧 Image Resize"
+    }
+  },
+  "185": {
+    "inputs": {
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  }
+}

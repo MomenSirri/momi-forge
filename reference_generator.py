@@ -8,7 +8,6 @@ import os
 import re
 import tempfile
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +31,11 @@ from utils import (
     _to_pil_image,
     prepare_json,
     save_input_image_as_base64,
+)
+from workflow_ui import (
+    debug_checkbox_visibility_update as _debug_checkbox_visibility_update,
+    request_header as _request_header,
+    save_workflow_debug_json,
 )
 
 _app_log_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
@@ -95,12 +99,6 @@ REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES = max(
             os.getenv("RUNPOD_MAX_REQUEST_BYTES", str(10 * 1024 * 1024)),
         )
     ),
-)
-WORKFLOW_DEBUG_JSON_DIR = Path(
-    os.getenv(
-        "WORKFLOW_DEBUG_JSON_DIR",
-        str(Path(__file__).resolve().parent / "trace_logs" / "workflow_debug"),
-    )
 )
 
 TERMINAL_FAILURES = {"FAILED", "ERROR", "TIMED_OUT", "CANCELLED"}
@@ -251,45 +249,18 @@ BOTTOM_PROGRESS_LAYOUT_CSS = """
 auth_service = get_auth_service()
 
 
-def _request_header(request: gr.Request, key: str) -> str | None:
-    headers = getattr(request, "headers", None) or {}
-    return headers.get(key) or headers.get(key.lower()) or headers.get(key.title())
-
-
-def _is_admin_identity(email: str | None) -> bool:
-    normalized_email = (email or "").strip()
-    if not normalized_email:
-        return False
-    identity = auth_service.get_identity(normalized_email)
-    return str(getattr(identity, "role", "") or "").strip().lower() == "admin"
-
-
-def _debug_checkbox_visibility_update(request: gr.Request):
-    return gr.update(
-        visible=_is_admin_identity(getattr(request, "username", None)),
-        value=False,
-    )
-
-
 def _save_workflow_debug_json(
     payload: dict[str, Any],
     *,
     workflow_name: str,
     task_id: str,
 ) -> Path:
-    workflow_payload: Any = payload
-    if isinstance(payload, dict):
-        input_payload = payload.get("input")
-        if isinstance(input_payload, dict) and isinstance(input_payload.get("workflow"), dict):
-            workflow_payload = input_payload["workflow"]
-
-    WORKFLOW_DEBUG_JSON_DIR.mkdir(parents=True, exist_ok=True)
-    safe_workflow = re.sub(r"[^a-zA-Z0-9_-]+", "_", workflow_name).strip("_") or "workflow"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_path = WORKFLOW_DEBUG_JSON_DIR / f"reference_generator_{safe_workflow}_{task_id}_{timestamp}.json"
-    with open(debug_path, "w", encoding="utf-8") as outfile:
-        json.dump(workflow_payload, outfile, indent=2)
-    return debug_path
+    return save_workflow_debug_json(
+        payload,
+        workflow_name=workflow_name,
+        task_id=task_id,
+        prefix="reference_generator",
+    )
 
 
 def _format_byte_size(value: int) -> str:

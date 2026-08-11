@@ -1,0 +1,233 @@
+{
+  "categories": [
+    {
+      "id": "daylight",
+      "title": "☀️ Daylight"
+    },
+    {
+      "id": "golden-hour",
+      "title": "🌅 Golden Hour"
+    },
+    {
+      "id": "night",
+      "title": "🌙 Night"
+    },
+    {
+      "id": "blue-hour",
+      "title": "🌆 Blue Hour"
+    },
+    {
+      "id": "overcast",
+      "title": "☁️ Overcast"
+    },
+    {
+      "id": "rain",
+      "title": "🌧️ Rain"
+    },
+    {
+      "id": "winter",
+      "title": "❄️ Winter"
+    },
+    {
+      "id": "autumn",
+      "title": "🍂 Autumn"
+    }
+  ],
+  "presets": [
+    {
+      "id": "bright-natural-sunlight",
+      "title": "Bright Natural Sunlight",
+      "category": "daylight",
+      "description": "Clean, vivid daylight with natural color and balanced shadow detail.",
+      "prompt": "Bright natural sunlight, clear vivid blue sky (not oversaturated), balanced exposure with soft shadow detail, moderate contrast, true-to-life color grading, crisp clean highlights, fresh open-air atmosphere, natural realistic photography style.",
+      "tags": [
+        "bright",
+        "blue sky",
+        "natural",
+        "sunlight"
+      ]
+    },
+    {
+      "id": "soft-natural-daylight",
+      "title": "Soft Natural Daylight",
+      "category": "daylight",
+      "description": "Soft editorial daylight with muted shadows and crisp architectural detail.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, soft natural daylight, gentle even highlights, soft muted shadows, simple clear blue sky, low-to-moderate contrast, true-to-life natural color grading, crisp sharp detail, clean balanced exposure, calm still atmosphere, editorial architectural photography style.",
+      "tags": [
+        "architecture",
+        "editorial",
+        "fujifilm",
+        "soft light"
+      ]
+    },
+    {
+      "id": "warm-afternoon",
+      "title": "Warm Afternoon",
+      "category": "daylight",
+      "description": "Relaxed afternoon sun with gentle warmth and true-to-life color.",
+      "prompt": "Warm afternoon sunlight, clear natural blue sky, soft golden-tinted highlights, balanced exposure with gentle shadow detail, moderate contrast, true-to-life warm color grading, crisp clean clarity, relaxed sunny atmosphere, natural realistic photography style.",
+      "tags": [
+        "afternoon",
+        "blue sky",
+        "golden highlights",
+        "warm"
+      ]
+    },
+    {
+      "id": "cinematic-golden-hour",
+      "title": "Cinematic Golden Hour",
+      "category": "golden-hour",
+      "description": "Low-angle golden light with rim lighting and a cinematic warm-cool balance.",
+      "prompt": "Golden hour sunlight, blue sky, gentle warm-cool color balance, warm golden highlights with subtle natural amber tones, low-to-moderate contrast, true-to-life natural color grading, crisp clean clarity, low sun angle casting soft directional light, calm natural atmosphere, natural realistic photography style, sharp focus with shallow-to-moderate depth of field, gentle rim lighting on edges.",
+      "tags": [
+        "cinematic",
+        "golden hour",
+        "rim light",
+        "warm-cool"
+      ]
+    },
+    {
+      "id": "editorial-golden-hour",
+      "title": "Editorial Golden Hour",
+      "category": "golden-hour",
+      "description": "Balanced editorial golden hour with warm highlights and cool shadows.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, golden-hour lighting, warm highlights, gentle cool shadows, natural blue sky, moderate contrast, true-to-life color grading, crisp sharp detail, clean balanced exposure, calm still atmosphere, editorial architectural photography style.",
+      "tags": [
+        "architecture",
+        "editorial",
+        "fujifilm",
+        "golden hour"
+      ]
+    },
+    {
+      "id": "deep-blue-night",
+      "title": "Deep Blue Night",
+      "category": "night",
+      "description": "A calm deep-blue night with retained detail and warm window-light contrast.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, deep blue night sky (not overly dark), soft ambient night light, cool natural lighting, balanced exposure, defined shadow detail, moderate contrast, true-to-life natural color grading, soft blues, greys, and muted browns, warm glowing window lights if present, crisp clean clarity, calm quiet atmosphere, natural realistic photography style, crisp cold night air. Preserve the original framing, geometry, and textures.",
+      "tags": [
+        "blue night",
+        "cool",
+        "preserve geometry",
+        "window lights"
+      ]
+    },
+    {
+      "id": "natural-night",
+      "title": "Natural Night",
+      "category": "night",
+      "description": "A restrained natural-night conversion that explicitly preserves scene content.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5. Keep all original elements, composition, structures, and details exactly as they are—do not add, remove, or change any objects, people, or scene content. Only adjust the lighting and color grading to simulate a clear natural night: subtle muted blue night sky, soft ambient night light, cool-neutral lighting, balanced exposure, defined shadow detail, moderate contrast, true-to-life natural color grading, muted greys and browns with only a faint hint of blue, warm glowing window lights if present, crisp clarity, calm atmosphere, and crisp cold night air. Preserve the exact framing, geometry, and texture of the original image.",
+      "tags": [
+        "natural night",
+        "preserve content",
+        "subtle blue",
+        "window lights"
+      ]
+    },
+    {
+      "id": "blue-hour-clear",
+      "title": "Blue Hour (Clear)",
+      "category": "blue-hour",
+      "description": "Crisp, haze-free blue hour with cool grading and warm interiors.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, blue-hour twilight, cool desaturated color grading with muted teal-grey tones, warm glowing interior lights as focal contrast, soft diffused light, moderate-to-low contrast, clean crisp clarity with no haze or mist, cinematic moody ambiance, tranquil quiet mood, elevated landscape photography style.",
+      "tags": [
+        "blue hour",
+        "clear",
+        "no haze",
+        "warm interiors"
+      ]
+    },
+    {
+      "id": "blue-hour-moody",
+      "title": "Blue Hour (Moody)",
+      "category": "blue-hour",
+      "description": "Misty, cinematic blue hour with muted teal-grey tones.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, blue-hour twilight, cool desaturated color grading with muted teal-grey tones, warm glowing interior lights as focal contrast, soft overcast diffused light, moderate-to-low contrast, gentle misty atmosphere, cinematic moody ambiance, tranquil quiet mood, elevated landscape photography style.",
+      "tags": [
+        "blue hour",
+        "cinematic",
+        "mist",
+        "moody"
+      ]
+    },
+    {
+      "id": "soft-overcast",
+      "title": "Soft Overcast",
+      "category": "overcast",
+      "description": "Even overcast light with a pale sky and restrained editorial contrast.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, overcast diffused lighting, soft even highlights, gentle muted shadows, flat pale grey-white sky, low-to-moderate contrast, true-to-life natural color grading, crisp sharp detail, clean balanced exposure, calm still atmosphere, editorial architectural photography style.",
+      "tags": [
+        "diffused",
+        "editorial",
+        "overcast",
+        "soft shadows"
+      ]
+    },
+    {
+      "id": "clearing-after-rain",
+      "title": "Clearing After Rain",
+      "category": "rain",
+      "description": "Breaking sunlight after rain with fresh color and damp surface detail.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, clearing sky after rain with soft breaking sunlight, pale blue sky with soft clouds, warm sunlight mixed with cool ambient light, balanced exposure, moderate contrast, soft shadow detail, true-to-life natural color grading, damp ground with subtle texture, fresh greens, soft greys, warm browns, crisp clean clarity, refreshed atmosphere, natural realistic photography style.",
+      "tags": [
+        "after rain",
+        "breaking sunlight",
+        "damp ground",
+        "fresh"
+      ]
+    },
+    {
+      "id": "overcast-after-rain",
+      "title": "Overcast After Rain",
+      "category": "rain",
+      "description": "Cool post-rain overcast light with muted color and damp-ground sheen.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, overcast daylight after light rain with soft diffused light, natural muted grey-blue sky, cool flat lighting with gentle shadow detail, balanced exposure, moderate contrast, true-to-life desaturated color grading, damp ground with subtle sheen and visible texture, natural palette of soft greys, browns, and faded greens, crisp clean clarity, calm atmosphere, fresh cool air.",
+      "tags": [
+        "after rain",
+        "cool",
+        "damp ground",
+        "overcast"
+      ]
+    },
+    {
+      "id": "mild-winter-day",
+      "title": "Mild Winter Day",
+      "category": "winter",
+      "description": "Soft low winter sun with a light dusting of snow and natural color.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, mild winter daylight with a soft low sun, pale blue sky, cool natural light with a gentle warm glow, balanced exposure, defined shadow detail, moderate contrast, true-to-life natural color grading, light dusting of snow with visible ground beneath, soft greys, browns, faded greens, crisp clarity, calm winter atmosphere.",
+      "tags": [
+        "daylight",
+        "low sun",
+        "mild winter",
+        "snow"
+      ]
+    },
+    {
+      "id": "snowy-winter-night",
+      "title": "Snowy Winter Night",
+      "category": "winter",
+      "description": "Clear snowy night with cool ambient light and warm windows.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, clear snowy winter night, deep blue night sky, soft ambient night light, balanced exposure, defined shadow detail, moderate contrast, true-to-life natural color grading, light snow covering with visible texture beneath, muted blues, greys, warm window lights, crisp clarity, calm winter night atmosphere.",
+      "tags": [
+        "night",
+        "snow",
+        "warm windows",
+        "winter"
+      ]
+    },
+    {
+      "id": "late-afternoon-autumn",
+      "title": "Late Afternoon Autumn",
+      "category": "autumn",
+      "description": "Late autumn sun with restrained amber tones and cool blue-grey shadows.",
+      "prompt": "Reportage photography shot on Fujifilm X-T5, late afternoon autumn light with warm low-angle sunlight across the cityscape, moderate contrast, soft shadows, gentle highlights, slightly desaturated golden amber and honey tones on illuminated facades, cool blue-grey shadows, subtle atmospheric haze, pale blue-grey sky, muted yellow, ochre, and soft rust tones, long soft shadows, tranquil golden mood with a cool undertone, naturalistic color grading with reduced saturation and a gentle tonal range.",
+      "tags": [
+        "amber",
+        "autumn",
+        "late afternoon",
+        "low-angle sun"
+      ]
+    }
+  ]
+}

@@ -5,10 +5,8 @@ import json
 import logging
 import os
 import random
-import re
 import tempfile
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +22,11 @@ from gradio_imageslider import ImageSlider
 from auth_service import get_auth_service
 from runpod_api_class import RunpodAPI
 from task_tracking import TaskTracker, WorkflowContext, extract_artifacts_from_status
+from workflow_ui import (
+    debug_checkbox_visibility_update as _debug_checkbox_visibility_update,
+    request_header as _request_header,
+    save_workflow_debug_json,
+)
 from utils import (
     PHASE_COMPLETED,
     PHASE_PREPARATION,
@@ -98,12 +101,6 @@ APP_ENVIRONMENT = os.getenv("APP_ENVIRONMENT", "seed")
 WORKFLOW_VERSION = os.getenv("WORKFLOW_VERSION_5K", "unknown")
 WORKFLOW_CATEGORY = os.getenv("WORKFLOW_CATEGORY_5K", "upscaling")
 WORKFLOW_TYPE = os.getenv("WORKFLOW_TYPE_5K", "image")
-WORKFLOW_DEBUG_JSON_DIR = Path(
-    os.getenv(
-        "WORKFLOW_DEBUG_JSON_DIR",
-        str(Path(__file__).resolve().parent / "trace_logs" / "workflow_debug"),
-    )
-)
 SEEDVR_TILE_DIVISOR_DEFAULT = 900
 SEEDVR_PREP_MAX_WIDTH_DEFAULT = 12800
 SEEDVR_PREP_MAX_HEIGHT_DEFAULT = 12800
@@ -122,42 +119,18 @@ BOTTOM_PROGRESS_LAYOUT_CSS = """
 """
 
 
-def _request_header(request: gr.Request, key: str) -> str | None:
-    headers = getattr(request, "headers", None) or {}
-    return headers.get(key) or headers.get(key.lower()) or headers.get(key.title())
-
-
-def _is_admin_identity(email: str | None) -> bool:
-    normalized_email = (email or "").strip()
-    if not normalized_email:
-        return False
-    identity = auth_service.get_identity(normalized_email)
-    return str(getattr(identity, "role", "") or "").strip().lower() == "admin"
-
-
-def _debug_checkbox_visibility_update(request: gr.Request):
-    return gr.update(visible=_is_admin_identity(getattr(request, "username", None)), value=False)
-
-
 def _save_workflow_debug_json(
     payload: dict[str, Any],
     *,
     workflow_name: str,
     task_id: str,
 ) -> Path:
-    workflow_payload: Any = payload
-    if isinstance(payload, dict):
-        input_payload = payload.get("input")
-        if isinstance(input_payload, dict) and isinstance(input_payload.get("workflow"), dict):
-            workflow_payload = input_payload["workflow"]
-
-    WORKFLOW_DEBUG_JSON_DIR.mkdir(parents=True, exist_ok=True)
-    safe_workflow = re.sub(r"[^a-zA-Z0-9_-]+", "_", (workflow_name or WORKFLOW_NAME)).strip("_") or "workflow"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_path = WORKFLOW_DEBUG_JSON_DIR / f"upscaler_{safe_workflow}_{task_id}_{timestamp}.json"
-    with open(debug_path, "w", encoding="utf-8") as outfile:
-        json.dump(workflow_payload, outfile, indent=2)
-    return debug_path
+    return save_workflow_debug_json(
+        payload,
+        workflow_name=workflow_name or WORKFLOW_NAME,
+        task_id=task_id,
+        prefix="upscaler",
+    )
 
 
 def _resize_keep_ratio_cap(
