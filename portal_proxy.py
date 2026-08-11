@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import os
 import secrets
 import time
@@ -17,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from auth_service import COMPANY_DOMAIN, get_auth_service
 import portal_auth
 
+
+logger = logging.getLogger(__name__)
 
 APP_PUBLIC_HOST = os.getenv("APP_PUBLIC_HOST", "").strip()
 SPLASH_ASSETS_DIR = Path(__file__).resolve().parent / "splash_assets"
@@ -65,6 +68,13 @@ RUNPOD_MANAGEMENT_API_UPSTREAM_URL = os.getenv(
     "RUNPOD_MANAGEMENT_API_UPSTREAM_URL",
     "https://127.0.0.1:8843",
 ).strip()
+RUNPOD_MANAGEMENT_API_CA_BUNDLE_ENV = (
+    "RUNPOD_MANAGEMENT_API_CA_BUNDLE"
+)
+RUNPOD_MANAGEMENT_API_CA_BUNDLE = os.getenv(
+    RUNPOD_MANAGEMENT_API_CA_BUNDLE_ENV,
+    str(Path(__file__).resolve().parent / "openssl" / "cert.pem"),
+).strip()
 RUNPOD_MANAGEMENT_COOKIE_NAME = "momi_runpod_management"
 RUNPOD_MANAGEMENT_SSO_TTL_SECONDS = max(
     60,
@@ -90,6 +100,35 @@ RUNPOD_BILLING_EMAILS = {
 }
 
 auth_service = get_auth_service()
+_warned_missing_ca_paths: set[str] = set()
+
+
+def _resolve_runpod_management_ca_bundle() -> str:
+    configured = (
+        RUNPOD_MANAGEMENT_API_CA_BUNDLE
+        or str(Path(__file__).resolve().parent / "openssl" / "cert.pem")
+    )
+    ca_path = Path(configured).expanduser()
+    if ca_path.is_file():
+        return str(ca_path)
+
+    path_text = str(ca_path)
+    message = (
+        f"{RUNPOD_MANAGEMENT_API_CA_BUNDLE_ENV} points to a missing "
+        f"CA bundle: {path_text}"
+    )
+    if path_text not in _warned_missing_ca_paths:
+        logger.warning(message)
+        _warned_missing_ca_paths.add(path_text)
+    raise FileNotFoundError(message)
+
+
+def _create_runpod_management_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=60.0,
+        verify=_resolve_runpod_management_ca_bundle(),
+    )
 
 
 def _normalize_role(value: str | None) -> str:
@@ -602,7 +641,7 @@ def create_server_app(*, blocks: gr.Blocks) -> FastAPI:
         body = await request.body()
 
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0, verify=False) as client:
+            async with _create_runpod_management_client() as client:
                 upstream_response = await client.request(
                     method=request.method,
                     url=target_url,
