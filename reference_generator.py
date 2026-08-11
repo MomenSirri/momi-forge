@@ -37,6 +37,7 @@ from workflow_ui import (
     request_header as _request_header,
     save_workflow_debug_json,
 )
+from workflow_progress import ProgressTracker, StageSpec
 
 _app_log_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, _app_log_level, logging.INFO))
@@ -102,12 +103,6 @@ REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES = max(
 )
 
 TERMINAL_FAILURES = {"FAILED", "ERROR", "TIMED_OUT", "CANCELLED"}
-SAMPLER_PROGRESS_PATTERN = re.compile(r"node=(?P<node>[^ ]+)\s+(?P<done>\d+)/(?P<total>\d+)")
-FRACTION_PATTERN = re.compile(r"(?P<done>\d+)/(?P<total>\d+)")
-RUNNING_NODE_PATTERN = re.compile(r"Running node (?P<node>\d+(?::\d+)?):\s*(?P<label>.+)$")
-NODE_ID_EQUALS_PATTERN = re.compile(r"\bnode=(?P<node>\d+(?::\d+)?)\b")
-NODE_ID_PREFIX_PATTERN = re.compile(r"^(?P<node>\d+(?::\d+)?)\b")
-
 NODE_MAIN_IMAGE_INPUT = "42"
 NODE_REFERENCE_IMAGE_INPUT = "43"
 NODE_IPADAPTER_ADVANCED = "30"
@@ -349,159 +344,34 @@ def _render_idle_status() -> str:
     )
 
 
-def _create_stage_state(*, enabled: bool, label: str) -> dict[str, Any]:
-    return {
-        "enabled": enabled,
-        "label": label,
-        "progress": 0.0,
-        "started": False,
-        "finished": False,
-    }
-
-
 def _init_reference_progress_tracker(
     *,
     enhancement_enabled: bool,
     color_match_enabled: bool,
-) -> dict[str, Any]:
-    return {
-        "phase": STAGE_LABELS[STAGE_PREPARATION],
-        "current_stage": STAGE_PREPARATION,
-        "current_status": "Preparing workflow...",
-        "last_node_id": None,
-        "stages": {
-            STAGE_PREPARATION: _create_stage_state(enabled=True, label=STAGE_LABELS[STAGE_PREPARATION]),
-            STAGE_CONDITIONING: _create_stage_state(enabled=True, label=STAGE_LABELS[STAGE_CONDITIONING]),
-            STAGE_BASE_SAMPLING: _create_stage_state(enabled=True, label=STAGE_LABELS[STAGE_BASE_SAMPLING]),
-            STAGE_UPSCALE: _create_stage_state(enabled=True, label=STAGE_LABELS[STAGE_UPSCALE]),
-            STAGE_ENHANCEMENT: _create_stage_state(
-                enabled=bool(enhancement_enabled),
-                label=STAGE_LABELS[STAGE_ENHANCEMENT],
+) -> ProgressTracker:
+    specs = [
+        StageSpec(
+            stage_key,
+            STAGE_LABELS[stage_key],
+            weight=STAGE_WEIGHTS[stage_key],
+            enabled=(
+                bool(enhancement_enabled)
+                if stage_key == STAGE_ENHANCEMENT
+                else bool(enhancement_enabled and color_match_enabled)
+                if stage_key == STAGE_COLOR_MATCH
+                else True
             ),
-            STAGE_COLOR_MATCH: _create_stage_state(
-                enabled=bool(enhancement_enabled and color_match_enabled),
-                label=STAGE_LABELS[STAGE_COLOR_MATCH],
-            ),
-            STAGE_SAVE: _create_stage_state(enabled=True, label=STAGE_LABELS[STAGE_SAVE]),
-        },
-    }
-
-
-def _extract_node_id(text: str | None) -> str | None:
-    if not text:
-        return None
-    stripped = text.strip()
-    running_match = RUNNING_NODE_PATTERN.match(stripped)
-    if running_match:
-        return running_match.group("node").strip()
-    equals_match = NODE_ID_EQUALS_PATTERN.search(stripped)
-    if equals_match:
-        return equals_match.group("node").strip()
-    prefix_match = NODE_ID_PREFIX_PATTERN.match(stripped)
-    if prefix_match:
-        return prefix_match.group("node").strip()
-    return None
-
-
-def _transition_to_stage(tracker: dict[str, Any], stage_key: str) -> None:
-    if stage_key not in tracker["stages"]:
-        return
-
-    target_index = STAGE_ORDER.index(stage_key)
-    for index, existing_key in enumerate(STAGE_ORDER):
-        stage = tracker["stages"][existing_key]
-        if not stage.get("enabled"):
-            continue
-        if index < target_index:
-            stage["started"] = True
-            stage["finished"] = True
-            stage["progress"] = max(float(stage.get("progress") or 0.0), 1.0)
-
-    stage = tracker["stages"][stage_key]
-    if stage.get("enabled"):
-        stage["started"] = True
-        tracker["current_stage"] = stage_key
-        tracker["phase"] = stage["label"]
-
-
-def _set_stage_progress(
-    tracker: dict[str, Any],
-    stage_key: str,
-    ratio: float,
-    *,
-    message: str | None = None,
-    node_id: str | None = None,
-) -> None:
-    stage = tracker["stages"].get(stage_key)
-    if not stage or not stage.get("enabled"):
-        return
-
-    _transition_to_stage(tracker, stage_key)
-    clamped = max(0.0, min(float(ratio), 1.0))
-    stage["progress"] = max(float(stage.get("progress") or 0.0), clamped)
-    if stage["progress"] >= 1.0:
-        stage["finished"] = True
-
-    tracker["last_node_id"] = node_id or tracker.get("last_node_id")
-    if message:
-        tracker["current_status"] = message
-    else:
-        tracker["current_status"] = NODE_STATUS_HINTS.get(node_id or "", stage["label"])
-
-
-def _set_stage_status_from_node(tracker: dict[str, Any], node_id: str | None) -> None:
-    if not node_id:
-        return
-
-    stage_key = NODE_STAGE_HINTS.get(node_id)
-    if not stage_key:
-        return
-
-    stage = tracker["stages"].get(stage_key)
-    if not stage or not stage.get("enabled"):
-        return
-
-    hinted_ratio = NODE_STAGE_PROGRESS_HINTS.get(node_id, 0.05)
-    _set_stage_progress(
-        tracker,
-        stage_key,
-        hinted_ratio,
-        message=NODE_STATUS_HINTS.get(node_id, stage["label"]),
-        node_id=node_id,
-    )
-
-
-def _compute_reference_overall_percent(
-    tracker: dict[str, Any],
-    *,
-    completed: bool = False,
-    runpod_progress: int | float | None = None,
-) -> int:
-    if completed:
-        return 100
-
-    active_stage_keys = [
-        stage_key
+        )
         for stage_key in STAGE_ORDER
-        if tracker["stages"][stage_key].get("enabled")
     ]
-    if not active_stage_keys:
-        fallback = int(float(runpod_progress)) if isinstance(runpod_progress, (int, float)) else 0
-        return max(0, min(fallback, 99))
-
-    total_weight = sum(float(STAGE_WEIGHTS[stage_key]) for stage_key in active_stage_keys)
-    if total_weight <= 0:
-        return 0
-
-    weighted_ratio = 0.0
-    for stage_key in active_stage_keys:
-        stage = tracker["stages"][stage_key]
-        weighted_ratio += float(stage.get("progress") or 0.0) * float(STAGE_WEIGHTS[stage_key])
-
-    percent = int(round((weighted_ratio / total_weight) * 99))
-    if isinstance(runpod_progress, (int, float)):
-        percent = max(percent, min(int(float(runpod_progress)), 96))
-    return max(0, min(percent, 99))
+    return ProgressTracker.for_reference(
+        specs=specs,
+        node_stage_hints=NODE_STAGE_HINTS,
+        node_status_hints=NODE_STATUS_HINTS,
+        node_progress_hints=NODE_STAGE_PROGRESS_HINTS,
+        save_stage_key=STAGE_SAVE,
+        save_node_id=NODE_ENHANCEMENT_IMAGE_ROUTER,
+    )
 
 
 def _reference_display_stage(tracker: dict[str, Any], *, queued: bool = False) -> str:
@@ -521,90 +391,6 @@ def _render_reference_progress_panel(
     message = title
     accent = "#f59e0b" if queued else "#38bdf8"
     return _render_status_panel(title, message, percent=overall_percent, accent=accent)
-
-
-def _update_progress_tracker_from_text(progress_text: str, tracker: dict[str, Any]) -> None:
-    text = (progress_text or "").strip()
-    if not text:
-        return
-
-    lower = text.lower()
-    node_id = _extract_node_id(text)
-
-    sampler_match = SAMPLER_PROGRESS_PATTERN.search(text)
-    if sampler_match:
-        node_id = sampler_match.group("node").strip()
-        stage_key = NODE_STAGE_HINTS.get(node_id)
-        done = int(sampler_match.group("done"))
-        total = max(int(sampler_match.group("total")), 1)
-        if stage_key:
-            _set_stage_progress(
-                tracker,
-                stage_key,
-                done / total,
-                message=f"{STAGE_LABELS[stage_key]} - step {done}/{total}",
-                node_id=node_id,
-            )
-            return
-
-    running_match = RUNNING_NODE_PATTERN.match(text)
-    if running_match:
-        _set_stage_status_from_node(tracker, running_match.group("node").strip())
-        return
-
-    if node_id:
-        _set_stage_status_from_node(tracker, node_id)
-
-    if "execution finished" in lower:
-        _set_stage_progress(
-            tracker,
-            STAGE_SAVE,
-            0.9,
-            message="Execution finished. Collecting output...",
-            node_id=NODE_ENHANCEMENT_IMAGE_ROUTER,
-        )
-        return
-
-    if "fetching execution history" in lower or "collecting images" in lower:
-        _set_stage_progress(
-            tracker,
-            STAGE_SAVE,
-            0.95,
-            message="Collecting output image...",
-            node_id=NODE_ENHANCEMENT_IMAGE_ROUTER,
-        )
-        return
-
-    if "job completed. returning" in lower:
-        _set_stage_progress(
-            tracker,
-            STAGE_SAVE,
-            0.98,
-            message="Finalizing output...",
-            node_id=NODE_ENHANCEMENT_IMAGE_ROUTER,
-        )
-        return
-
-    fraction_match = FRACTION_PATTERN.search(text)
-    current_stage = tracker["stages"].get(str(tracker.get("current_stage") or ""))
-    if fraction_match and current_stage and current_stage.get("enabled"):
-        done = int(fraction_match.group("done"))
-        total = max(int(fraction_match.group("total")), 1)
-        _set_stage_progress(
-            tracker,
-            str(tracker["current_stage"]),
-            done / total,
-            message=f"{tracker['phase']} - step {done}/{total}",
-            node_id=node_id,
-        )
-        return
-
-    if not node_id and lower.startswith("still running"):
-        tracker["current_status"] = text
-        return
-
-    if not node_id and text:
-        tracker["current_status"] = text
 
 
 def _disable_generate_button() -> dict[str, Any]:
@@ -1099,7 +885,7 @@ async def reference_generator_generate(
         for event_progress, progress_text in progress_events:
             if progress_text:
                 last_progress_text = progress_text
-                _update_progress_tracker_from_text(progress_text, progress_tracker)
+                progress_tracker.observe_text(progress_text)
             if isinstance(event_progress, (int, float)):
                 effective_progress = event_progress
 
@@ -1107,8 +893,7 @@ async def reference_generator_generate(
             last_runpod_progress = effective_progress
 
         if has_final_output:
-            _set_stage_progress(
-                progress_tracker,
+            progress_tracker.set_stage_progress(
                 STAGE_SAVE,
                 0.98,
                 message="Finalizing output...",
@@ -1124,8 +909,7 @@ async def reference_generator_generate(
 
         overall_percent = max(
             last_overall_percent,
-            _compute_reference_overall_percent(
-                progress_tracker,
+            progress_tracker.overall_percent(
                 runpod_progress=last_runpod_progress,
             ),
         )

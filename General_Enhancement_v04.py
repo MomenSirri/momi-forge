@@ -7,10 +7,8 @@ import html
 import io
 import json
 import logging
-import math
 import os
 import random
-import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -33,6 +31,15 @@ from workflow_ui import (
     debug_checkbox_visibility_update as _debug_checkbox_visibility_update,
     request_header as _request_header,
     save_workflow_debug_json,
+)
+from workflow_progress import (
+    COUNT_MODE_CYCLE,
+    COUNT_MODE_ITEM_COUNTER,
+    PHASE_COMPLETED,
+    PHASE_PREPARATION,
+    ProgressTracker,
+    StageSpec,
+    extract_node_id,
 )
 from utils import (
     _extract_progress_signal,
@@ -124,40 +131,10 @@ NODE_QWEN_MERGE = "30"
 NODE_PROMPT_TEXT = "35"
 TILE_DIVISOR_PX = 900
 
-COMFY_LOG_PATTERN = re.compile(r"^\[comfy-log\]\[(?P<phase>[^\]]+)\]\s*(?P<message>.*)$")
-NODE_PROGRESS_PATTERN = re.compile(
-    r"^node=(?P<node>[^ ]+)\s+(?P<done>\d+)/(?P<total>\d+)$"
-)
-ENHANCE_ITEM_PATTERN = re.compile(
-    r"^node=(?P<node>[^ ]+)\s+done=(?P<done>\d+)(?:\s+total=(?P<total>\d+))?$"
-)
-ENHANCE_STATE_PATTERN = re.compile(
-    r"^(?:node=(?P<node>[^ ]+)\s+)?done=(?P<done>\d+)(?:\s+total=(?P<total>\d+))?$"
-)
-ENHANCE_STEP_PATTERN = re.compile(
-    r"^node=(?P<node>[^ ]+)\s+item=(?P<item_done>\d+)(?:/(?P<item_total>\d+))?\s+step=(?P<step_done>\d+)/(?P<step_total>\d+)$"
-)
-FRACTION_PATTERN = re.compile(r"^(?P<done>\d+)(?:/(?P<total>\d+))?$")
-ENHANCE_SAMPLE_NODE_PATTERN = re.compile(
-    r"^node=(?P<node>[^ ]+)\s+(?P<done>\d+)(?:/(?P<total>\d+))?$"
-)
-RUNNING_NODE_PATTERN = re.compile(
-    r"^Running node (?P<node>\d+(?::\d+)?):\s*(?P<label>.+)$"
-)
-NODE_ID_PREFIX_PATTERN = re.compile(r"^(?P<node>\d+(?::\d+)?)\b")
-
-PHASE_PREPARATION = "Preparation"
-PHASE_WRAP_UP = "Wrap-up"
-PHASE_COMPLETED = "Completed"
-
 STAGE_GENERAL = "general"
 STAGE_ADVANCE = "advance"
 STAGE_BODY = "body"
 STAGE_FACE = "face"
-
-COUNT_MODE_CYCLE = "cycle"
-COUNT_MODE_ITEM_COUNTER = "item_counter"
-COUNT_MODE_FRACTION_DIRECT = "fraction_direct"
 
 STAGE_ORDER = [STAGE_GENERAL, STAGE_ADVANCE, STAGE_BODY, STAGE_FACE]
 STAGE_LABELS = {
@@ -448,15 +425,6 @@ def _extract_error_message(status: dict[str, Any]) -> str:
     return "\n".join(deduped)
 
 
-def _extract_node_id(text: str | None) -> str | None:
-    if not text:
-        return None
-    match = NODE_ID_PREFIX_PATTERN.match(text.strip())
-    if not match:
-        return None
-    return match.group("node")
-
-
 def _estimate_tile_count(width: int, height: int) -> tuple[int, int, int]:
     safe_width = max(int(width or 0), 1)
     safe_height = max(int(height or 0), 1)
@@ -467,38 +435,6 @@ def _estimate_tile_count(width: int, height: int) -> tuple[int, int, int]:
     return columns, rows, columns * rows
 
 
-def _create_stage_state(
-    *,
-    enabled: bool,
-    label: str,
-    unit_label: str,
-    node_id: str,
-    total: int | None,
-    dynamic_total: bool,
-    count_mode: str = COUNT_MODE_CYCLE,
-) -> dict[str, Any]:
-    return {
-        "enabled": enabled,
-        "label": label,
-        "unit_label": unit_label,
-        "node_id": node_id,
-        "count_mode": count_mode,
-        "total": total if enabled else 0,
-        "dynamic_total": dynamic_total,
-        "done": 0,
-        "started": False,
-        "finished": not enabled,
-        "step_done": None,
-        "step_total": None,
-        "last_step": None,
-        "last_total": None,
-        "cycle_complete": False,
-        "peak_step": 0,
-        "step_item": None,
-        "runtime_done_events_seen": False,
-    }
-
-
 def _init_progress_tracker(
     *,
     image_width: int,
@@ -506,55 +442,54 @@ def _init_progress_tracker(
     general_enhance: bool,
     advance_details: bool,
     body_enhance: bool,
-) -> dict[str, Any]:
+) -> ProgressTracker:
     columns, rows, tile_count = _estimate_tile_count(image_width, image_height)
-    return {
-        "phase": PHASE_PREPARATION,
-        "current_stage": None,
-        "current_status": "Preparing workflow...",
-        "wrap_ratio": 0.0,
-        "tile_columns": columns,
-        "tile_rows": rows,
-        "tile_count": tile_count,
-        "stages": {
-            STAGE_GENERAL: _create_stage_state(
-                enabled=general_enhance,
-                label=STAGE_LABELS[STAGE_GENERAL],
-                unit_label=STAGE_UNIT_LABELS[STAGE_GENERAL],
-                node_id=NODE_SD_SAMPLER,
-                total=tile_count if general_enhance else 0,
-                dynamic_total=False,
-                count_mode=COUNT_MODE_ITEM_COUNTER,
-            ),
-            STAGE_ADVANCE: _create_stage_state(
-                enabled=advance_details,
-                label=STAGE_LABELS[STAGE_ADVANCE],
-                unit_label=STAGE_UNIT_LABELS[STAGE_ADVANCE],
-                node_id=NODE_FLUX_SAMPLER,
-                total=tile_count if advance_details else 0,
-                dynamic_total=False,
-                count_mode=COUNT_MODE_ITEM_COUNTER,
-            ),
-            STAGE_BODY: _create_stage_state(
-                enabled=body_enhance,
-                label=STAGE_LABELS[STAGE_BODY],
-                unit_label=STAGE_UNIT_LABELS[STAGE_BODY],
-                node_id=NODE_BODY_SAMPLER_1,
-                total=None,
-                dynamic_total=True,
-                count_mode=COUNT_MODE_CYCLE,
-            ),
-            STAGE_FACE: _create_stage_state(
-                enabled=body_enhance,
-                label=STAGE_LABELS[STAGE_FACE],
-                unit_label=STAGE_UNIT_LABELS[STAGE_FACE],
-                node_id=NODE_BODY_SAMPLER_2,
-                total=None,
-                dynamic_total=True,
-                count_mode=COUNT_MODE_CYCLE,
-            ),
-        },
+    enabled_by_stage = {
+        STAGE_GENERAL: bool(general_enhance),
+        STAGE_ADVANCE: bool(advance_details),
+        STAGE_BODY: bool(body_enhance),
+        STAGE_FACE: bool(body_enhance),
     }
+    node_by_stage = {
+        STAGE_GENERAL: NODE_SD_SAMPLER,
+        STAGE_ADVANCE: NODE_FLUX_SAMPLER,
+        STAGE_BODY: NODE_BODY_SAMPLER_1,
+        STAGE_FACE: NODE_BODY_SAMPLER_2,
+    }
+    specs = [
+        StageSpec(
+            stage_key,
+            STAGE_LABELS[stage_key],
+            total=(
+                tile_count
+                if stage_key in {STAGE_GENERAL, STAGE_ADVANCE}
+                else None
+            ),
+            enabled=enabled_by_stage[stage_key],
+            unit_label=STAGE_UNIT_LABELS[stage_key],
+            node_id=node_by_stage[stage_key],
+            dynamic_total=stage_key in {STAGE_BODY, STAGE_FACE},
+            count_mode=(
+                COUNT_MODE_ITEM_COUNTER
+                if stage_key in {STAGE_GENERAL, STAGE_ADVANCE}
+                else COUNT_MODE_CYCLE
+            ),
+        )
+        for stage_key in STAGE_ORDER
+    ]
+    return ProgressTracker.for_general(
+        specs=specs,
+        tile_columns=columns,
+        tile_rows=rows,
+        node_stage_hints=NODE_STAGE_HINTS,
+        node_status_hints=NODE_STATUS_HINTS,
+        sampler_node_to_stage=SAMPLER_NODE_TO_STAGE,
+        wrap_milestones=STAGE_WRAP_MILESTONES,
+        save_node_id=NODE_SAVE_IMAGE,
+        sampling_ceiling=SAMPLING_PROGRESS_CEILING,
+        sync_stage_keys=(STAGE_GENERAL, STAGE_ADVANCE),
+        advance_stage_key=STAGE_ADVANCE,
+    )
 
 
 def _effective_stage_total(stage: dict[str, Any]) -> int:
@@ -580,98 +515,6 @@ def _effective_stage_total(stage: dict[str, Any]) -> int:
     return provisional
 
 
-def _stage_total_for_overall(stage: dict[str, Any]) -> int:
-    if not stage.get("enabled"):
-        return 0
-    total = stage.get("total")
-    if isinstance(total, int):
-        return max(total, 0)
-    return max(_effective_stage_total(stage), 1)
-
-
-def _stage_completed_units(stage: dict[str, Any]) -> float:
-    if not stage.get("enabled"):
-        return 0.0
-
-    mode = stage.get("count_mode")
-    completed = float(stage.get("done") or 0)
-    step_done = stage.get("step_done")
-    step_total = stage.get("step_total")
-
-    if mode == COUNT_MODE_ITEM_COUNTER:
-        step_item = stage.get("step_item")
-        if (
-            stage.get("started")
-            and not stage.get("finished")
-            and isinstance(step_done, int)
-            and isinstance(step_total, int)
-            and step_total > 0
-            and isinstance(step_item, int)
-            and step_item > int(stage.get("done") or 0)
-        ):
-            completed += max(0.0, min(1.0, step_done / step_total))
-        return completed
-
-    if mode == COUNT_MODE_FRACTION_DIRECT:
-        return completed
-
-    if (
-        stage.get("started")
-        and not stage.get("finished")
-        and isinstance(step_done, int)
-        and isinstance(step_total, int)
-        and step_total > 0
-        and not stage.get("cycle_complete")
-    ):
-        completed += max(0.0, min(1.0, step_done / step_total))
-    return completed
-
-
-def _clamp_ratio(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
-
-
-def _compute_general_overall_percent(
-    tracker: dict[str, Any],
-    *,
-    completed: bool = False,
-) -> int:
-    if completed:
-        return 100
-
-    enabled_stages = [
-        tracker["stages"][stage_key]
-        for stage_key in STAGE_ORDER
-        if tracker["stages"][stage_key].get("enabled")
-    ]
-    if not enabled_stages:
-        wrap_ratio = _clamp_ratio(tracker.get("wrap_ratio") or 0.0)
-        if tracker.get("phase") == PHASE_WRAP_UP or wrap_ratio > 0:
-            return max(1, min(99, int(round(wrap_ratio * 99))))
-        return 0
-
-    total_units = sum(_stage_total_for_overall(stage) for stage in enabled_stages)
-    completed_units = sum(_stage_completed_units(stage) for stage in enabled_stages)
-
-    sampling_ratio = (
-        _clamp_ratio(completed_units / total_units)
-        if total_units > 0
-        else 0.0
-    )
-    wrap_ratio = _clamp_ratio(tracker.get("wrap_ratio") or 0.0)
-    wrap_span = max(1, 99 - SAMPLING_PROGRESS_CEILING)
-
-    sampling_percent = sampling_ratio * SAMPLING_PROGRESS_CEILING
-    if tracker.get("phase") == PHASE_WRAP_UP or wrap_ratio > 0:
-        percent = int(round(sampling_percent + (wrap_ratio * wrap_span)))
-        if tracker.get("phase") == PHASE_WRAP_UP:
-            percent = max(percent, min(SAMPLING_PROGRESS_CEILING, 99))
-    else:
-        percent = int(round(sampling_percent))
-
-    return max(0, min(99, percent))
-
-
 def _stage_display_value(stage: dict[str, Any]) -> str:
     if not stage.get("enabled"):
         return "Off"
@@ -690,44 +533,6 @@ def _stage_display_value(stage: dict[str, Any]) -> str:
     if effective_total > 0:
         return f"{done}/{effective_total}"
     return f"{done} done"
-
-
-def _stage_current_index(stage: dict[str, Any]) -> int:
-    mode = stage.get("count_mode")
-    current_index = int(stage.get("done") or 0)
-
-    if mode == COUNT_MODE_ITEM_COUNTER:
-        step_item = stage.get("step_item")
-        if isinstance(step_item, int) and step_item > 0:
-            return max(step_item, current_index, 1)
-        return max(current_index, 1)
-
-    if mode == COUNT_MODE_FRACTION_DIRECT:
-        if stage.get("started") and current_index <= 0:
-            return 1
-        return max(current_index, 1)
-
-    if stage.get("started") and not stage.get("finished") and not stage.get("cycle_complete"):
-        current_index += 1
-    return max(current_index, 1)
-
-
-def _stage_sampling_status(stage: dict[str, Any]) -> str:
-    label = stage["label"]
-    unit_label = stage["unit_label"]
-    effective_total = _effective_stage_total(stage)
-    current_index = _stage_current_index(stage)
-
-    if effective_total > 0:
-        prefix = f"{label} - {unit_label} {min(current_index, effective_total)} of {effective_total}"
-    else:
-        prefix = f"{label} - {unit_label} {current_index}"
-
-    step_done = stage.get("step_done")
-    step_total = stage.get("step_total")
-    if isinstance(step_done, int) and isinstance(step_total, int) and step_total > 0:
-        prefix += f" (sampling step {step_done} of {step_total})"
-    return prefix
 
 
 def _render_general_notice_panel(
@@ -809,484 +614,6 @@ def _render_general_progress_panel(
   <div style="margin-top:10px;font-size:12px;opacity:.78;">{safe_tile_note}</div>
 </div>
 """
-
-
-def _reconcile_stage_cycle(
-    stage: dict[str, Any],
-    *,
-    mark_finished: bool = False,
-    near_complete_ratio: float = 0.85,
-) -> None:
-    if not stage.get("enabled"):
-        return
-
-    last_total = stage.get("last_total")
-    peak_step = int(stage.get("peak_step") or 0)
-    allow_near_complete_reconcile = not (
-        stage.get("count_mode") == COUNT_MODE_ITEM_COUNTER
-        and stage.get("runtime_done_events_seen")
-    )
-    if (
-        allow_near_complete_reconcile
-        and stage.get("started")
-        and not stage.get("cycle_complete")
-        and isinstance(last_total, int)
-        and last_total > 0
-        and peak_step >= max(1, int(math.ceil(last_total * near_complete_ratio)))
-    ):
-        stage["done"] += 1
-
-    if mark_finished:
-        if stage.get("dynamic_total"):
-            current_total = stage.get("total")
-            stage["total"] = max(
-                int(current_total or 0),
-                int(stage.get("done") or 0),
-            )
-        else:
-            fixed_total = stage.get("total")
-            if isinstance(fixed_total, int):
-                done_value = max(0, int(stage.get("done") or 0))
-                if fixed_total > 0 and done_value >= (fixed_total - 1):
-                    stage["done"] = fixed_total
-                else:
-                    stage["done"] = min(done_value, fixed_total)
-        stage["finished"] = True
-
-    fixed_total = stage.get("total")
-    if isinstance(fixed_total, int) and fixed_total >= 0:
-        stage["done"] = min(int(stage.get("done") or 0), fixed_total)
-
-    stage["step_done"] = None
-    stage["step_total"] = None
-    stage["last_step"] = None
-    stage["last_total"] = None
-    stage["cycle_complete"] = False
-    stage["peak_step"] = 0
-    stage["step_item"] = None
-
-
-def _transition_to_stage(tracker: dict[str, Any], stage_key: str | None) -> None:
-    current_stage = tracker.get("current_stage")
-    if stage_key == current_stage:
-        return
-
-    if current_stage in tracker["stages"]:
-        _reconcile_stage_cycle(tracker["stages"][current_stage], mark_finished=True)
-
-    if stage_key is None:
-        tracker["current_stage"] = None
-        tracker["phase"] = PHASE_WRAP_UP
-        return
-
-    stage = tracker["stages"].get(stage_key)
-    if not stage or not stage.get("enabled"):
-        return
-
-    stage["started"] = True
-    stage["finished"] = False
-    tracker["current_stage"] = stage_key
-    tracker["phase"] = stage["label"]
-
-
-def _mark_wrap_progress(tracker: dict[str, Any], ratio: float) -> None:
-    tracker["wrap_ratio"] = max(
-        _clamp_ratio(tracker.get("wrap_ratio") or 0.0),
-        _clamp_ratio(ratio),
-    )
-
-
-def _set_wrap_status(
-    tracker: dict[str, Any],
-    message: str,
-    *,
-    min_wrap_ratio: float | None = None,
-) -> None:
-    _transition_to_stage(tracker, None)
-    tracker["phase"] = PHASE_WRAP_UP
-    tracker["current_status"] = message
-    if min_wrap_ratio is not None:
-        _mark_wrap_progress(tracker, min_wrap_ratio)
-
-
-def _set_stage_status_from_node(
-    tracker: dict[str, Any],
-    node_id: str | None,
-) -> None:
-    if not node_id:
-        return
-
-    wrap_milestone = STAGE_WRAP_MILESTONES.get(node_id)
-    if wrap_milestone is not None:
-        _mark_wrap_progress(tracker, wrap_milestone)
-
-    if node_id == NODE_SAVE_IMAGE:
-        _set_wrap_status(
-            tracker,
-            NODE_STATUS_HINTS[NODE_SAVE_IMAGE],
-            min_wrap_ratio=wrap_milestone,
-        )
-        return
-
-    stage_key = NODE_STAGE_HINTS.get(node_id)
-    if not stage_key:
-        return
-
-    stage = tracker["stages"].get(stage_key)
-    if not stage or not stage.get("enabled"):
-        return
-
-    _transition_to_stage(tracker, stage_key)
-    tracker["current_status"] = NODE_STATUS_HINTS.get(node_id, stage["label"])
-
-
-def _set_stage_runtime_total(stage: dict[str, Any], total: int | None) -> None:
-    if not isinstance(total, int) or total <= 0:
-        return
-    stage["total"] = total
-
-
-def _sync_general_total_with_advance_runtime(tracker: dict[str, Any]) -> None:
-    general_stage = tracker["stages"].get(STAGE_GENERAL)
-    advance_stage = tracker["stages"].get(STAGE_ADVANCE)
-    if (
-        not general_stage
-        or not advance_stage
-        or not general_stage.get("enabled")
-        or not advance_stage.get("enabled")
-        or not general_stage.get("runtime_done_events_seen")
-    ):
-        return
-
-    advance_total = advance_stage.get("total")
-    general_total = general_stage.get("total")
-    advance_done = max(0, int(advance_stage.get("done") or 0))
-
-    if not isinstance(advance_total, int) or advance_total <= 0:
-        return
-
-    if not isinstance(general_total, int) or general_total <= 0 or advance_total > general_total:
-        general_stage["total"] = advance_total
-        general_total = advance_total
-
-    # Both stages operate over the same tile grid; if Advance reports more completed
-    # tiles, General cannot be behind in wrap-up/status snapshots.
-    general_stage["done"] = min(
-        max(int(general_stage.get("done") or 0), advance_done),
-        int(general_total),
-    )
-
-
-def _observe_stage_done_count(
-    tracker: dict[str, Any],
-    *,
-    stage_key: str,
-    done: int,
-    total: int | None = None,
-) -> None:
-    stage = tracker["stages"][stage_key]
-    if not stage.get("enabled"):
-        return
-
-    _transition_to_stage(tracker, stage_key)
-    stage["started"] = True
-    stage["finished"] = False
-    first_runtime_done_event = not stage.get("runtime_done_events_seen")
-    stage["runtime_done_events_seen"] = True
-
-    _set_stage_runtime_total(stage, total)
-
-    done_value = max(0, int(done))
-    current_total = stage.get("total")
-    if (
-        total is None
-        and isinstance(current_total, int)
-        and done_value > current_total
-    ):
-        stage["total"] = done_value
-
-    if first_runtime_done_event:
-        stage["done"] = done_value
-    else:
-        stage["done"] = max(int(stage.get("done") or 0), done_value)
-    fixed_total = stage.get("total")
-    if isinstance(fixed_total, int) and fixed_total >= 0:
-        stage["done"] = min(stage["done"], fixed_total)
-    stage["step_item"] = stage["done"]
-    stage["step_done"] = None
-    stage["step_total"] = None
-    stage["cycle_complete"] = True
-    if stage_key == STAGE_ADVANCE:
-        _sync_general_total_with_advance_runtime(tracker)
-
-    tracker["current_status"] = _stage_sampling_status(stage)
-
-
-def _observe_stage_item_step(
-    tracker: dict[str, Any],
-    *,
-    stage_key: str,
-    item_done: int,
-    item_total: int | None,
-    step_done: int,
-    step_total: int,
-) -> None:
-    stage = tracker["stages"][stage_key]
-    if not stage.get("enabled"):
-        return
-
-    _transition_to_stage(tracker, stage_key)
-    stage["started"] = True
-    stage["finished"] = False
-
-    _set_stage_runtime_total(stage, item_total)
-
-    stage["step_item"] = max(1, int(item_done))
-    current_total = stage.get("total")
-    if (
-        item_total is None
-        and isinstance(current_total, int)
-        and stage["step_item"] > current_total
-    ):
-        stage["total"] = stage["step_item"]
-
-    stage["step_done"] = max(0, int(step_done))
-    stage["step_total"] = max(1, int(step_total))
-    stage["last_step"] = stage["step_done"]
-    stage["last_total"] = stage["step_total"]
-    stage["peak_step"] = max(int(stage.get("peak_step") or 0), stage["step_done"])
-
-    if stage["runtime_done_events_seen"]:
-        stage["cycle_complete"] = (
-            stage["step_item"] <= int(stage.get("done") or 0)
-            and stage["step_done"] >= stage["step_total"]
-        )
-    else:
-        stage["cycle_complete"] = stage["step_done"] >= stage["step_total"]
-        if stage["cycle_complete"]:
-            stage["done"] = max(int(stage.get("done") or 0), stage["step_item"])
-            fixed_total = stage.get("total")
-            if isinstance(fixed_total, int) and fixed_total >= 0:
-                stage["done"] = min(stage["done"], fixed_total)
-
-    tracker["current_status"] = _stage_sampling_status(stage)
-
-
-def _observe_sampler_progress(
-    tracker: dict[str, Any],
-    *,
-    stage_key: str,
-    step_done: int,
-    step_total: int,
-) -> None:
-    stage = tracker["stages"][stage_key]
-    if not stage.get("enabled"):
-        return
-
-    _transition_to_stage(tracker, stage_key)
-    stage["started"] = True
-    stage["finished"] = False
-
-    last_total = stage.get("last_total")
-    last_step = stage.get("last_step")
-
-    if isinstance(last_total, int) and last_total > 0 and last_total != step_total:
-        _reconcile_stage_cycle(stage, mark_finished=False)
-        last_step = None
-
-    if isinstance(last_step, int) and step_done < last_step:
-        _reconcile_stage_cycle(stage, mark_finished=False)
-
-    stage["step_done"] = step_done
-    stage["step_total"] = step_total
-    stage["last_step"] = step_done
-    stage["last_total"] = step_total
-    stage["peak_step"] = max(int(stage.get("peak_step") or 0), step_done)
-
-    mode = stage.get("count_mode")
-    if mode == COUNT_MODE_FRACTION_DIRECT:
-        _set_stage_runtime_total(stage, step_total)
-        stage["done"] = max(
-            int(stage.get("done") or 0),
-            max(0, min(step_done, step_total)),
-        )
-        if stage_key == STAGE_ADVANCE:
-            _sync_general_total_with_advance_runtime(tracker)
-        stage["cycle_complete"] = True
-    elif mode == COUNT_MODE_ITEM_COUNTER and stage.get("runtime_done_events_seen"):
-        stage["cycle_complete"] = step_done >= step_total
-    elif step_total > 0 and step_done >= step_total:
-        if not stage.get("cycle_complete"):
-            stage["done"] += 1
-        stage["cycle_complete"] = True
-        stage["peak_step"] = 0
-    else:
-        stage["cycle_complete"] = False
-
-    if mode == COUNT_MODE_ITEM_COUNTER:
-        inferred_item = int(stage.get("done") or 0)
-        if not stage.get("cycle_complete"):
-            inferred_item += 1
-        stage["step_item"] = max(1, inferred_item)
-    else:
-        stage["step_item"] = None
-
-    fixed_total = stage.get("total")
-    if (
-        mode != COUNT_MODE_FRACTION_DIRECT
-        and isinstance(fixed_total, int)
-        and fixed_total > 0
-        and int(stage.get("done") or 0) > fixed_total
-    ):
-        stage["total"] = int(stage.get("done") or 0)
-        fixed_total = stage["total"]
-
-    if isinstance(fixed_total, int) and fixed_total >= 0:
-        stage["done"] = min(int(stage.get("done") or 0), fixed_total)
-
-    tracker["current_status"] = _stage_sampling_status(stage)
-
-
-def _update_progress_tracker_from_text(
-    progress_text: str,
-    tracker: dict[str, Any],
-) -> None:
-    text = progress_text.strip()
-    if not text:
-        return
-
-    lower = text.lower()
-    if tracker["phase"] == PHASE_PREPARATION:
-        if "starting job and validating input" in lower:
-            tracker["current_status"] = "Starting job and validating input..."
-        elif "connected to comfyui worker" in lower:
-            tracker["current_status"] = "Connected to ComfyUI worker."
-        elif "workflow queued" in lower:
-            tracker["current_status"] = "Workflow queued. Waiting for execution..."
-        elif "execution started" in lower:
-            tracker["current_status"] = "Execution started."
-
-    parsed = COMFY_LOG_PATTERN.match(text)
-    if parsed:
-        comfy_phase = parsed.group("phase").strip().lower()
-        phase_message = parsed.group("message").strip()
-
-        if comfy_phase in {"enhance-item", "enhance-state"}:
-            pattern = ENHANCE_ITEM_PATTERN if comfy_phase == "enhance-item" else ENHANCE_STATE_PATTERN
-            state_match = pattern.match(phase_message)
-            if state_match:
-                node_id = (state_match.groupdict().get("node") or NODE_SD_SAMPLER).strip()
-                done = int(state_match.group("done"))
-                total_raw = state_match.groupdict().get("total")
-                total = int(total_raw) if total_raw and total_raw.isdigit() else None
-                stage_key = SAMPLER_NODE_TO_STAGE.get(node_id)
-                if stage_key and tracker["stages"][stage_key].get("enabled"):
-                    _observe_stage_done_count(
-                        tracker,
-                        stage_key=stage_key,
-                        done=done,
-                        total=total,
-                    )
-                    return
-
-        if comfy_phase == "enhance-step":
-            step_match = ENHANCE_STEP_PATTERN.match(phase_message)
-            if step_match:
-                node_id = step_match.group("node")
-                stage_key = SAMPLER_NODE_TO_STAGE.get(node_id)
-                if stage_key and tracker["stages"][stage_key].get("enabled"):
-                    item_total_raw = step_match.group("item_total")
-                    _observe_stage_item_step(
-                        tracker,
-                        stage_key=stage_key,
-                        item_done=int(step_match.group("item_done")),
-                        item_total=int(item_total_raw) if item_total_raw and item_total_raw.isdigit() else None,
-                        step_done=int(step_match.group("step_done")),
-                        step_total=int(step_match.group("step_total")),
-                    )
-                    return
-
-        if comfy_phase == "enhance-sample":
-            # Prefer node-qualified samples; plain "N" / "N/M" is ambiguous when
-            # multiple enhancement sampler nodes are active in one workflow.
-            node_sample = ENHANCE_SAMPLE_NODE_PATTERN.match(phase_message)
-            if node_sample:
-                node_id = node_sample.group("node")
-                stage_key = SAMPLER_NODE_TO_STAGE.get(node_id)
-                if stage_key and tracker["stages"][stage_key].get("enabled"):
-                    done = int(node_sample.group("done"))
-                    total_raw = node_sample.group("total")
-                    _observe_stage_done_count(
-                        tracker,
-                        stage_key=stage_key,
-                        done=done,
-                        total=int(total_raw) if total_raw and total_raw.isdigit() else None,
-                    )
-                    return
-
-        if comfy_phase == "progress":
-            node_progress = NODE_PROGRESS_PATTERN.match(phase_message)
-            if node_progress:
-                node_id = node_progress.group("node")
-                done = int(node_progress.group("done"))
-                total = int(node_progress.group("total"))
-                stage_key = SAMPLER_NODE_TO_STAGE.get(node_id)
-                if stage_key and tracker["stages"][stage_key].get("enabled"):
-                    _observe_sampler_progress(
-                        tracker,
-                        stage_key=stage_key,
-                        step_done=done,
-                        step_total=total,
-                    )
-                    return
-
-        if comfy_phase in {"node", "executed"}:
-            node_id = _extract_node_id(phase_message)
-            if comfy_phase == "executed":
-                stage_key = SAMPLER_NODE_TO_STAGE.get(node_id or "")
-                if stage_key and tracker["stages"][stage_key].get("enabled"):
-                    _reconcile_stage_cycle(
-                        tracker["stages"][stage_key],
-                        mark_finished=False,
-                    )
-            _set_stage_status_from_node(tracker, node_id)
-            return
-
-        if comfy_phase == "execution" and "finished" in phase_message.lower():
-            _set_wrap_status(
-                tracker,
-                "Execution finished. Collecting output...",
-                min_wrap_ratio=0.90,
-            )
-            return
-
-        if comfy_phase == "status" and "queue_remaining=0" in phase_message.lower():
-            _set_wrap_status(
-                tracker,
-                "Finalizing output...",
-                min_wrap_ratio=0.88,
-            )
-            return
-
-    running_node = RUNNING_NODE_PATTERN.match(text)
-    if running_node:
-        _set_stage_status_from_node(tracker, running_node.group("node").strip())
-        return
-
-    if lower.startswith("still running"):
-        if tracker.get("current_status"):
-            return
-        tracker["current_status"] = "Still running..."
-        return
-
-    if "fetching execution history" in lower:
-        _set_wrap_status(tracker, "Preparing final output...", min_wrap_ratio=0.94)
-    elif "processing output nodes and collecting images" in lower:
-        _set_wrap_status(tracker, "Collecting generated images...", min_wrap_ratio=0.96)
-    elif "collecting images from node" in lower:
-        _set_wrap_status(tracker, "Collecting output image...", min_wrap_ratio=0.97)
-    elif "job completed. returning" in lower:
-        _set_wrap_status(tracker, "Finalizing output...", min_wrap_ratio=0.99)
 
 
 def _connect(prompt: dict[str, Any], target_node: str, input_name: str, source_node: str, output_idx: int = 0) -> None:
@@ -1873,8 +1200,7 @@ async def enhance_image(
                     height=result_image.height,
                 )
 
-                _transition_to_stage(progress_tracker, None)
-                progress_tracker["phase"] = PHASE_COMPLETED
+                progress_tracker.mark_completed()
                 progress_tracker["current_status"] = "Completed."
                 tracker.complete(
                     result_url=artifacts.get("result_url"),
@@ -1903,8 +1229,7 @@ async def enhance_image(
                 return
             except Exception as err:
                 if has_final_output and state != "COMPLETED":
-                    _set_wrap_status(
-                        progress_tracker,
+                    progress_tracker.start_wrap(
                         "Finalizing output...",
                         min_wrap_ratio=0.95,
                     )
@@ -1915,7 +1240,7 @@ async def enhance_image(
                     )
                     overall_percent = max(
                         last_overall_percent,
-                        _compute_general_overall_percent(progress_tracker),
+                        progress_tracker.overall_percent(),
                     )
                     last_overall_percent = overall_percent
                     yield (
@@ -1975,11 +1300,10 @@ async def enhance_image(
 
         if progress_events:
             for progress_text in progress_events:
-                _update_progress_tracker_from_text(progress_text, progress_tracker)
+                progress_tracker.observe_text(progress_text)
         else:
             if completion_hint_seen_at is not None:
-                _set_wrap_status(
-                    progress_tracker,
+                progress_tracker.start_wrap(
                     "Finalizing output...",
                     min_wrap_ratio=0.92,
                 )
@@ -1988,7 +1312,7 @@ async def enhance_image(
 
         overall_percent = max(
             last_overall_percent,
-            _compute_general_overall_percent(progress_tracker),
+            progress_tracker.overall_percent(),
         )
         last_overall_percent = overall_percent
         tracker.emit_processing(
@@ -2001,7 +1325,7 @@ async def enhance_image(
             .replace(" ", "_"),
             message=str(progress_tracker.get("current_status") or "Processing..."),
             progress_percent=overall_percent,
-            node_id=_extract_node_id(str(progress_tracker.get("current_status") or "")),
+            node_id=extract_node_id(str(progress_tracker.get("current_status") or "")),
             metadata={
                 "runpod_state": state,
                 "phase": progress_tracker.get("phase"),

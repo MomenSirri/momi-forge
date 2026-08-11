@@ -27,13 +27,13 @@ from workflow_ui import (
     request_header as _request_header,
     save_workflow_debug_json,
 )
-from utils import (
+from workflow_progress import (
     PHASE_COMPLETED,
-    PHASE_PREPARATION,
     PHASE_WRAP_UP,
+    ProgressTracker,
+)
+from utils import (
     _append_trace_event,
-    _apply_live_progress_text,
-    _compute_overall_percent,
     _decode_output_image,
     _extract_error_message,
     _extract_progress_signal,
@@ -450,48 +450,10 @@ async def fivek_generator(
     node_step_done: int | None = None
     node_step_total: int | None = None
     queue_remaining: str | None = None
-    phase_tracker: dict[str, Any] = {
-        "phase": PHASE_PREPARATION,
-        "prep_ratio": 0.05,
-        "upscale_done": 0,
-        "upscale_total": None,
-        "seedvr_frames_total": None,
-        "upscale_ratio": 0.0,
-        "seedvr_stage": None,
-        "enhance_done": 0,
-        "enhance_total": workflow_profile.get("enhancement_total_override"),
-        "enhance_ratio": 0.0,
-        "wrap_ratio": 0.0,
-        "enhance_cycle_complete": False,
-        "enhance_last_step": None,
-        "enhance_last_total_steps": None,
-        "enhance_peak_step": 0,
-        "enhance_runtime_seen": False,
-        "enhance_item_seen": False,
-        "enhance_log_pass": 1,
-        "enhance_log_last_step": None,
-        "enhance_log_last_total": None,
-        "upscale_node_id": workflow_profile.get("upscale_node_id"),
-        "enhancement_node_id": workflow_profile.get("enhancement_node_id"),
-        "wrap_up_node_ids": workflow_profile.get("wrap_up_node_ids", []),
-        "wrap_up_milestones": workflow_profile.get("wrap_up_milestones", {}),
-        "seedvr_runtime_enabled": workflow_profile.get("seedvr_runtime_enabled", False),
-        "upscale_label": workflow_profile.get("upscale_label", "Upscaling"),
-        "enhancement_label": workflow_profile.get("enhancement_label", "Enhancement"),
-        "enhancement_total_from_upscale": workflow_profile.get(
-            "enhancement_total_from_upscale", True
-        ),
-        "enhancement_total_override": workflow_profile.get(
-            "enhancement_total_override"
-        ),
-        "estimated_tile_columns": seedvr_tile_estimate.get("estimated_tile_columns"),
-        "estimated_tile_rows": seedvr_tile_estimate.get("estimated_tile_rows"),
-        "estimated_tile_count": seedvr_tile_estimate.get("estimated_tile_count"),
-        "estimated_tile_source_width": seedvr_tile_estimate.get("estimated_tile_source_width"),
-        "estimated_tile_source_height": seedvr_tile_estimate.get("estimated_tile_source_height"),
-        "estimated_tile_divisor": seedvr_tile_estimate.get("estimated_tile_divisor"),
-        "estimated_tile_note": seedvr_tile_estimate.get("estimated_tile_note"),
-    }
+    phase_tracker = ProgressTracker.for_phases(
+        workflow_profile=workflow_profile,
+        tile_estimate=seedvr_tile_estimate,
+    )
     last_overall_percent = 0
     consecutive_status_errors = 0
     stream_seen_signatures: set[str] = set()
@@ -816,7 +778,7 @@ async def fivek_generator(
                     queue_remaining,
                     live_logs,
                     last_log_line,
-                ) = _apply_live_progress_text(
+                ) = phase_tracker.apply_live_text(
                     progress_text=progress_text,
                     current_node=current_node,
                     node_step_done=node_step_done,
@@ -824,10 +786,9 @@ async def fivek_generator(
                     queue_remaining=queue_remaining,
                     live_logs=live_logs,
                     last_log_line=last_log_line,
-                    phase_tracker=phase_tracker,
                 )
                 overall_percent = max(
-                    last_overall_percent, _compute_overall_percent(phase_tracker)
+                    last_overall_percent, phase_tracker.overall_percent()
                 )
                 last_overall_percent = overall_percent
                 status_md = _render_live_status(
@@ -886,7 +847,7 @@ async def fivek_generator(
                 phase_tracker["phase"] = PHASE_WRAP_UP
                 phase_tracker["wrap_ratio"] = max(phase_tracker["wrap_ratio"], 0.92)
                 overall_percent = max(
-                    last_overall_percent, _compute_overall_percent(phase_tracker)
+                    last_overall_percent, phase_tracker.overall_percent()
                 )
                 last_overall_percent = overall_percent
                 status_md = _render_live_status(
@@ -919,7 +880,7 @@ async def fivek_generator(
                 yield gr.update(), status_md, job_id
             else:
                 overall_percent = max(
-                    last_overall_percent, _compute_overall_percent(phase_tracker)
+                    last_overall_percent, phase_tracker.overall_percent()
                 )
                 last_overall_percent = overall_percent
                 status_md = _render_live_status(
