@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import html
 import json
 import logging
@@ -20,7 +21,11 @@ from PIL import Image
 from gradio_imageslider import ImageSlider
 
 from auth_service import get_auth_service
-from runpod_api_class import RunpodAPI
+from runpod_api_class import (
+    RunpodAPI,
+    RunpodSubmissionError,
+    RunpodSubmissionUncertainError,
+)
 from task_tracking import TaskTracker, WorkflowContext, extract_artifacts_from_status
 from utils import (
     _decode_output_image,
@@ -464,6 +469,810 @@ def _save_temp_image(image: Image.Image, *, prefix: str) -> Path:
         return Path(tmp.name)
 
 
+class ReferencePreparationError(RuntimeError):
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+class ReferencePayloadTooLargeError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        payload_size: int,
+        main_size: tuple[int, int],
+        reference_size: tuple[int, int],
+    ) -> None:
+        super().__init__(message)
+        self.metadata = {
+            "payload_size_bytes": payload_size,
+            "max_payload_bytes": REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES,
+            "transport_main_size": list(main_size),
+            "transport_reference_size": list(reference_size),
+        }
+
+
+class ReferenceRequestError(RuntimeError):
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+@dataclass
+class ReferencePreparedInputs:
+    workflow_key: str
+    prompt: dict[str, Any]
+    main_pil: Image.Image
+    reference_pil: Image.Image
+    main_transport_pil: Image.Image
+    reference_transport_pil: Image.Image
+    main_image_b64: str
+    reference_image_b64: str
+    task_id: str
+    feature_flags: dict[str, Any]
+    settings_snapshot: dict[str, Any]
+
+
+@dataclass
+class ReferencePreparedJob:
+    inputs: ReferencePreparedInputs
+    payload: dict[str, Any]
+    workflow_debug_path: Path | None
+
+
+@dataclass
+class ReferenceRequestContext:
+    inputs: ReferencePreparedInputs
+    job: ReferencePreparedJob
+    tracker: TaskTracker
+
+
+@dataclass
+class ReferenceSubmissionResult:
+    job_id: str | None
+    error_message: str | None = None
+    uncertain: bool = False
+
+
+@dataclass
+class ReferenceFinalizedOutput:
+    result_image: Image.Image | None = None
+    left_path: Path | None = None
+    right_path: Path | None = None
+    artifacts: dict[str, Any] | None = None
+    error_message: str | None = None
+
+
+@dataclass
+class ReferencePollEvent:
+    kind: str
+    status: dict[str, Any]
+    title: str
+    message: str
+    progress_percent: int
+    stage: str
+    poll_idx: int
+    finalized: ReferenceFinalizedOutput | None = None
+    queued: bool = False
+    tracker_error_message: str | None = None
+
+
+@dataclass
+class ReferencePollState:
+    progress_tracker: ProgressTracker
+    last_progress_text: str | None = None
+    last_runpod_progress: int | float | None = None
+    last_overall_percent: int = 3
+    consecutive_status_errors: int = 0
+    stream_seen_signatures: set[str] = field(default_factory=set)
+    stream_seen_order: list[str] = field(default_factory=list)
+    stream_task: asyncio.Task[dict[str, Any]] | None = None
+
+    def cancel_stream(self) -> None:
+        if self.stream_task is not None and not self.stream_task.done():
+            self.stream_task.cancel()
+
+
+def _prepare_reference_inputs(
+    *,
+    main_image: Any,
+    reference_image: Any,
+    color_strength: float,
+    creativity: float,
+    structure_strength: float,
+    enhancement_enabled: bool,
+    color_match_enabled: bool,
+    workflow: str,
+) -> ReferencePreparedInputs:
+    if main_image is None or reference_image is None:
+        raise ReferencePreparationError(
+            "Input Error",
+            "Both Main Image and Reference Image are required.",
+        )
+
+    try:
+        prompt_path = _resolve_reference_generator_workflow_path()
+        try:
+            with open(prompt_path, "r", encoding="utf-8") as file:
+                prompt: dict[str, Any] = json.load(file)
+        except UnicodeDecodeError:
+            with open(prompt_path, "r", encoding="cp1252") as file:
+                prompt = json.load(file)
+    except Exception as err:
+        raise ReferencePreparationError(
+            "Workflow Error",
+            f"Prompt load failed: {err}",
+        ) from err
+
+    try:
+        main_pil = _to_pil_image(main_image)
+        reference_pil = _to_pil_image(reference_image)
+        if main_pil.mode not in ("RGB", "RGBA"):
+            main_pil = main_pil.convert("RGB")
+        if reference_pil.mode not in ("RGB", "RGBA"):
+            reference_pil = reference_pil.convert("RGB")
+    except Exception as err:
+        raise ReferencePreparationError(
+            "Input Error",
+            f"Image preparation failed: {err}",
+        ) from err
+
+    try:
+        main_transport_pil = _resize_for_runpod_transport(main_pil)
+        reference_transport_pil = _resize_for_runpod_transport(reference_pil)
+        main_image_b64 = save_input_image_as_base64(main_transport_pil)
+        reference_image_b64 = save_input_image_as_base64(reference_transport_pil)
+    except Exception as err:
+        raise ReferencePreparationError(
+            "Encoding Error",
+            f"Failed to encode input images: {err}",
+        ) from err
+
+    return ReferencePreparedInputs(
+        workflow_key=str(workflow or WORKFLOW_NAME),
+        prompt=prompt,
+        main_pil=main_pil,
+        reference_pil=reference_pil,
+        main_transport_pil=main_transport_pil,
+        reference_transport_pil=reference_transport_pil,
+        main_image_b64=main_image_b64,
+        reference_image_b64=reference_image_b64,
+        task_id=str(uuid.uuid4()),
+        feature_flags={
+            "enhancement_enabled": bool(enhancement_enabled),
+            "color_match_enabled": bool(color_match_enabled),
+        },
+        settings_snapshot={
+            "color_strength": float(color_strength),
+            "creativity": float(creativity),
+            "structure_strength": float(structure_strength),
+        },
+    )
+
+
+def _build_reference_payload(
+    prepared: ReferencePreparedInputs,
+    *,
+    color_strength: float,
+    creativity: float,
+    structure_strength: float,
+    enhancement_enabled: bool,
+    color_match_enabled: bool,
+    workflow_debug: bool,
+    is_admin_user: bool,
+) -> ReferencePreparedJob:
+    _apply_reference_workflow_updates(
+        prepared.prompt,
+        main_image_b64=prepared.main_image_b64,
+        reference_image_b64=prepared.reference_image_b64,
+        color_strength=float(color_strength),
+        creativity=float(creativity),
+        structure_strength=float(structure_strength),
+        enhancement_enabled=bool(enhancement_enabled),
+        color_match_enabled=bool(color_match_enabled and enhancement_enabled),
+    )
+    payload = prepare_json(prepared.prompt, images=[])
+    payload_size = _json_payload_size_bytes(payload)
+    if payload_size > REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES:
+        message = (
+            "The RunPod request is too large to submit "
+            f"({_format_byte_size(payload_size)}). "
+            f"The current limit is "
+            f"{_format_byte_size(REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES)}. "
+            "Use smaller main/reference images or lower "
+            "REFERENCE_GENERATOR_MAX_UPLOAD_EDGE."
+        )
+        raise ReferencePayloadTooLargeError(
+            message,
+            payload_size=payload_size,
+            main_size=prepared.main_transport_pil.size,
+            reference_size=prepared.reference_transport_pil.size,
+        )
+
+    workflow_debug_path: Path | None = None
+    if os.getenv("SAVE_DEBUG_PROMPT_JSON", "0") == "1" or (
+        workflow_debug and is_admin_user
+    ):
+        try:
+            workflow_debug_path = _save_workflow_debug_json(
+                payload,
+                workflow_name=prepared.workflow_key,
+                task_id=prepared.task_id,
+            )
+        except Exception as err:
+            logger.warning("Could not save debug prompt JSON: %s", err)
+    return ReferencePreparedJob(
+        inputs=prepared,
+        payload=payload,
+        workflow_debug_path=workflow_debug_path,
+    )
+
+
+def _create_reference_task_tracker(
+    prepared: ReferencePreparedInputs,
+    *,
+    identity: Any,
+    user_agent: str | None,
+    session_id: str,
+) -> TaskTracker:
+    return TaskTracker(
+        store=None,
+        task_id=prepared.task_id,
+        user_email=identity.email,
+        user_prefix=identity.username_prefix,
+        user_display_name=identity.display_name,
+        user_role=identity.role,
+        avatar_filename=identity.avatar_filename,
+        workflow=WorkflowContext(
+            key=prepared.workflow_key,
+            name=prepared.workflow_key,
+            version=WORKFLOW_VERSION,
+            category=WORKFLOW_CATEGORY,
+            workflow_type=WORKFLOW_TYPE,
+        ),
+        source_page="/tab/reference-generator",
+        browser_user_agent=user_agent,
+        session_id=session_id,
+        environment_name=APP_ENVIRONMENT,
+        feature_flags=prepared.feature_flags,
+        settings=prepared.settings_snapshot,
+        input_meta={
+            "width": int(prepared.main_pil.width),
+            "height": int(prepared.main_pil.height),
+            "resolution": (
+                f"{int(prepared.main_pil.width)}"
+                f"x{int(prepared.main_pil.height)}"
+            ),
+            "format": str(prepared.main_pil.mode),
+            "reference_width": int(prepared.reference_pil.width),
+            "reference_height": int(prepared.reference_pil.height),
+        },
+        request_summary=prepared.feature_flags,
+        prompt_type="reference_generation",
+        created_by=identity.email,
+    )
+
+
+def _prepare_reference_request(
+    *,
+    main_image: Any,
+    reference_image: Any,
+    color_strength: float,
+    creativity: float,
+    structure_strength: float,
+    enhancement_enabled: bool,
+    color_match_enabled: bool,
+    workflow_debug: bool,
+    workflow: str,
+    identity: Any,
+    user_agent: str | None,
+    session_id: str,
+) -> ReferenceRequestContext:
+    prepared = _prepare_reference_inputs(
+        main_image=main_image,
+        reference_image=reference_image,
+        color_strength=color_strength,
+        creativity=creativity,
+        structure_strength=structure_strength,
+        enhancement_enabled=enhancement_enabled,
+        color_match_enabled=color_match_enabled,
+        workflow=workflow,
+    )
+    tracker = _create_reference_task_tracker(
+        prepared,
+        identity=identity,
+        user_agent=user_agent,
+        session_id=session_id,
+    )
+    try:
+        job = _build_reference_payload(
+            prepared,
+            color_strength=color_strength,
+            creativity=creativity,
+            structure_strength=structure_strength,
+            enhancement_enabled=enhancement_enabled,
+            color_match_enabled=color_match_enabled,
+            workflow_debug=workflow_debug,
+            is_admin_user=(
+                str(getattr(identity, "role", "") or "")
+                .strip()
+                .lower()
+                == "admin"
+            ),
+        )
+    except Exception as err:
+        if isinstance(err, ReferencePayloadTooLargeError):
+            failure_reason = "request_payload_too_large"
+            title = "Input Too Large"
+            metadata = err.metadata
+            message = str(err)
+        else:
+            failure_reason = (
+                "workflow_key_missing"
+                if isinstance(err, KeyError)
+                else "workflow_update_error"
+            )
+            title = "Workflow Error"
+            metadata = None
+            message = (
+                f"Workflow key missing: {err}"
+                if isinstance(err, KeyError)
+                else f"Workflow update failed: {err}"
+            )
+        tracker.fail(
+            failure_reason=failure_reason,
+            error_message=str(err),
+            failure_stage="preparation",
+            progress_percent=0,
+            worker_id=None,
+            metadata=metadata,
+        )
+        raise ReferenceRequestError(title, message) from err
+    return ReferenceRequestContext(inputs=prepared, job=job, tracker=tracker)
+
+
+async def _submit_reference_job(
+    api: RunpodAPI,
+    payload: dict[str, Any],
+) -> ReferenceSubmissionResult:
+    try:
+        response = await api.run(payload)
+        return ReferenceSubmissionResult(job_id=str(response["id"]))
+    except RunpodSubmissionUncertainError as err:
+        return ReferenceSubmissionResult(
+            job_id=None,
+            error_message=(
+                f"{err}\n\nPlease check the Jobs page before trying again; "
+                "RunPod may already have accepted this request."
+            ),
+            uncertain=True,
+        )
+    except RunpodSubmissionError as err:
+        return ReferenceSubmissionResult(
+            job_id=None,
+            error_message=f"Job submission failed: {err}",
+        )
+    except Exception as err:
+        return ReferenceSubmissionResult(
+            job_id=None,
+            error_message=f"Job submission failed: {err}",
+        )
+
+
+async def _finalize_reference_output(
+    status: dict[str, Any],
+    *,
+    left_path: Path,
+) -> ReferenceFinalizedOutput:
+    try:
+        result_image = await _decode_output_image(status)
+        return ReferenceFinalizedOutput(
+            result_image=result_image,
+            left_path=left_path,
+            right_path=_save_temp_image(
+                result_image,
+                prefix="reference_generator_output",
+            ),
+            artifacts=extract_artifacts_from_status(status),
+        )
+    except Exception as err:
+        return ReferenceFinalizedOutput(error_message=str(err))
+
+
+async def _advance_reference_stream(
+    api: RunpodAPI,
+    job_id: str,
+    state: ReferencePollState,
+    *,
+    stream_enabled: bool,
+) -> list[tuple[int | float | None, str, list[str]]]:
+    entries: list[tuple[int | float | None, str, list[str]]] = []
+    if not stream_enabled:
+        return entries
+    if state.stream_task is not None and state.stream_task.done():
+        try:
+            response = state.stream_task.result()
+            entries, _ = _extract_stream_progress_signals(
+                response,
+                seen_signatures=state.stream_seen_signatures,
+                seen_order=state.stream_seen_order,
+            )
+        except Exception as err:
+            logger.debug("RunPod stream poll failed: %s", err)
+        finally:
+            state.stream_task = None
+    if state.stream_task is None:
+        state.stream_task = asyncio.create_task(api.stream(job_id))
+    return entries
+
+
+def _update_reference_poll_progress(
+    status: dict[str, Any],
+    stream_entries: list[tuple[int | float | None, str, list[str]]],
+    state: ReferencePollState,
+) -> ReferencePollEvent:
+    runpod_progress, status_progress_text, _ = _extract_progress_signal(status)
+    progress_events = [
+        (stream_progress, stream_text)
+        for stream_progress, stream_text, _ in stream_entries
+    ]
+    if status_progress_text:
+        progress_events.append((runpod_progress, status_progress_text))
+
+    effective_progress = runpod_progress
+    if not isinstance(effective_progress, (int, float)):
+        for stream_progress, _ in reversed(progress_events):
+            if isinstance(stream_progress, (int, float)):
+                effective_progress = stream_progress
+                break
+    for event_progress, progress_text in progress_events:
+        if progress_text:
+            state.last_progress_text = progress_text
+            state.progress_tracker.observe_text(progress_text)
+        if isinstance(event_progress, (int, float)):
+            effective_progress = event_progress
+    if isinstance(effective_progress, (int, float)):
+        state.last_runpod_progress = effective_progress
+
+    runpod_state = (status.get("status") or "UNKNOWN").upper()
+    if runpod_state == "IN_QUEUE":
+        state.progress_tracker["current_status"] = (
+            "Waiting for an available worker..."
+        )
+    elif not progress_events and runpod_state in {"IN_PROGRESS", "RUNNING"}:
+        if state.progress_tracker.get("current_stage") == STAGE_PREPARATION:
+            state.progress_tracker["current_status"] = (
+                "Waiting for next workflow update..."
+            )
+        elif state.last_progress_text:
+            state.progress_tracker["current_status"] = state.last_progress_text
+
+    overall_percent = max(
+        state.last_overall_percent,
+        state.progress_tracker.overall_percent(
+            runpod_progress=state.last_runpod_progress,
+        ),
+    )
+    state.last_overall_percent = overall_percent
+    queued = runpod_state == "IN_QUEUE"
+    return ReferencePollEvent(
+        kind="progress",
+        status=status,
+        title=_reference_display_stage(
+            state.progress_tracker,
+            queued=queued,
+        ),
+        message=str(
+            state.progress_tracker.get("current_status")
+            or state.last_progress_text
+            or runpod_state.replace("_", " ").title()
+        ),
+        progress_percent=max(overall_percent, 5) if queued else overall_percent,
+        stage=str(
+            state.progress_tracker.get("current_stage")
+            or state.progress_tracker.get("phase")
+            or "processing"
+        ).lower(),
+        poll_idx=0,
+        queued=queued,
+    )
+
+
+async def _poll_reference_job(
+    api: RunpodAPI,
+    job_id: str,
+    *,
+    left_path: Path,
+    state: ReferencePollState,
+    stream_enabled: bool = RUNPOD_STREAM_ENABLED,
+):
+    try:
+        for poll_idx in range(MAX_STATUS_POLLS):
+            stream_entries = await _advance_reference_stream(
+                api,
+                job_id,
+                state,
+                stream_enabled=stream_enabled,
+            )
+            try:
+                status = await api.status(job_id)
+            except Exception as err:
+                state.consecutive_status_errors += 1
+                if (
+                    state.consecutive_status_errors
+                    > MAX_CONSECUTIVE_STATUS_ERRORS
+                ):
+                    yield ReferencePollEvent(
+                        kind="status_error",
+                        status={},
+                        title="RunPod Error",
+                        message=f"Failed to check job status: {err}",
+                        progress_percent=int(
+                            state.last_runpod_progress or 0
+                        ),
+                        stage="processing",
+                        poll_idx=poll_idx,
+                        tracker_error_message=str(err),
+                    )
+                    return
+                yield ReferencePollEvent(
+                    kind="retry",
+                    status={},
+                    title="Temporary Connection Issue",
+                    message=(
+                        "Retrying while checking RunPod status.\n\n"
+                        f"{state.consecutive_status_errors}/"
+                        f"{MAX_CONSECUTIVE_STATUS_ERRORS}\n\n{err}"
+                    ),
+                    progress_percent=state.last_overall_percent,
+                    stage="processing",
+                    poll_idx=poll_idx,
+                )
+                await asyncio.sleep(
+                    RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S
+                )
+                continue
+
+            state.consecutive_status_errors = 0
+            runpod_state = (status.get("status") or "UNKNOWN").upper()
+            has_final_output = _has_final_output_payload(status)
+            if runpod_state in TERMINAL_FAILURES:
+                message = _extract_error_message(status)
+                yield ReferencePollEvent(
+                    kind="terminal_failure",
+                    status=status,
+                    title="RunPod Error",
+                    message=message,
+                    progress_percent=int(
+                        state.last_runpod_progress or 0
+                    ),
+                    stage="processing",
+                    poll_idx=poll_idx,
+                    tracker_error_message=message,
+                )
+                return
+            if runpod_state == "COMPLETED" or has_final_output:
+                finalized = await _finalize_reference_output(
+                    status,
+                    left_path=left_path,
+                )
+                if finalized.error_message:
+                    yield ReferencePollEvent(
+                        kind="decode_error",
+                        status=status,
+                        title="Decode Error",
+                        message=(
+                            "Failed to decode image: "
+                            f"{finalized.error_message}"
+                        ),
+                        progress_percent=max(
+                            int(state.last_runpod_progress or 0),
+                            96,
+                        ),
+                        stage="output_collecting",
+                        poll_idx=poll_idx,
+                        finalized=finalized,
+                        tracker_error_message=finalized.error_message,
+                    )
+                else:
+                    yield ReferencePollEvent(
+                        kind="completed",
+                        status=status,
+                        title="Image generated",
+                        message="Image generated",
+                        progress_percent=100,
+                        stage="completed",
+                        poll_idx=poll_idx,
+                        finalized=finalized,
+                    )
+                return
+
+            event = _update_reference_poll_progress(
+                status,
+                stream_entries,
+                state,
+            )
+            event.poll_idx = poll_idx
+            yield event
+            await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
+
+        yield ReferencePollEvent(
+            kind="timeout",
+            status={},
+            title="Timeout",
+            message="Timed out waiting for RunPod completion status.",
+            progress_percent=int(state.last_runpod_progress or 0),
+            stage="processing",
+            poll_idx=MAX_STATUS_POLLS,
+            tracker_error_message=(
+                "Timed out waiting for RunPod completion status."
+            ),
+        )
+    finally:
+        state.cancel_stream()
+
+
+def _record_reference_poll_event(
+    tracker: TaskTracker,
+    event: ReferencePollEvent,
+    *,
+    progress_tracker: ProgressTracker,
+    enhancement_enabled: bool,
+    color_match_enabled: bool,
+    workflow: str,
+) -> None:
+    if event.kind == "retry":
+        return
+    if event.kind == "progress":
+        tracker.emit_processing(
+            stage=event.stage,
+            message=event.message,
+            progress_percent=event.progress_percent,
+            metadata={
+                "poll_idx": event.poll_idx,
+                "runpod_state": event.status.get("status"),
+                "workflow": workflow,
+                "phase": progress_tracker.get("phase"),
+                "current_stage": progress_tracker.get("current_stage"),
+                "last_node_id": progress_tracker.get("last_node_id"),
+            },
+        )
+        return
+    if event.kind == "completed":
+        finalized = event.finalized
+        if (
+            finalized is None
+            or finalized.result_image is None
+            or finalized.left_path is None
+            or finalized.right_path is None
+        ):
+            raise ValueError(
+                "Completed Reference event is missing finalized output."
+            )
+        artifacts = finalized.artifacts or {}
+        thumbnail_path = tracker.add_thumbnail(
+            image=finalized.result_image,
+            output_index=0,
+        )
+        preview_path = tracker.add_preview(
+            image=finalized.result_image,
+            output_index=0,
+        )
+        output_filename = (
+            artifacts.get("output_filename")
+            or finalized.right_path.name
+        )
+        tracker.add_output_record(
+            output_index=0,
+            result_url=artifacts.get("result_url"),
+            thumbnail_url=thumbnail_path,
+            preview_url=preview_path,
+            file_name=output_filename,
+            width=finalized.result_image.width,
+            height=finalized.result_image.height,
+        )
+        tracker.complete(
+            result_url=artifacts.get("result_url"),
+            thumbnail_url=thumbnail_path,
+            preview_url=preview_path,
+            output_filename=output_filename,
+            output_count=max(
+                int(artifacts.get("output_count") or 0),
+                1,
+            ),
+            output_width=finalized.result_image.width,
+            output_height=finalized.result_image.height,
+            worker_id=artifacts.get("worker_id"),
+            result_summary={
+                "left_path": str(finalized.left_path),
+                "right_path": str(finalized.right_path),
+                "runpod_state": event.status.get("status"),
+                "enhancement_enabled": bool(enhancement_enabled),
+                "color_match_enabled": bool(color_match_enabled),
+            },
+        )
+        return
+
+    failure_reason = {
+        "status_error": "status_error",
+        "terminal_failure": (
+            f"runpod_{str(event.status.get('status') or 'unknown').lower()}"
+        ),
+        "decode_error": "decode_error",
+        "timeout": "timeout",
+    }.get(event.kind, event.kind)
+    tracker.fail(
+        failure_reason=failure_reason,
+        error_message=event.tracker_error_message or event.message,
+        failure_stage=event.stage,
+        progress_percent=event.progress_percent,
+        worker_id=event.status.get("workerId"),
+        metadata=(
+            {"runpod_state": event.status.get("status")}
+            if event.kind == "terminal_failure"
+            else None
+        ),
+    )
+
+
+def _render_reference_poll_event(
+    event: ReferencePollEvent,
+    state: ReferencePollState,
+    *,
+    job_id: str,
+) -> tuple[Any, str, str | None]:
+    if event.kind == "progress":
+        return (
+            gr.update(),
+            _render_reference_progress_panel(
+                state.progress_tracker,
+                overall_percent=event.progress_percent,
+                queued=event.queued,
+            ),
+            job_id,
+        )
+    if event.kind == "retry":
+        return (
+            gr.update(),
+            _render_status_panel(
+                event.title,
+                event.message,
+                percent=event.progress_percent,
+                accent="#f59e0b",
+            ),
+            job_id,
+        )
+    if event.kind == "completed":
+        finalized = event.finalized
+        if (
+            finalized is None
+            or finalized.left_path is None
+            or finalized.right_path is None
+        ):
+            raise ValueError(
+                "Completed Reference event is missing output paths."
+            )
+        return (
+            (str(finalized.left_path), str(finalized.right_path)),
+            _render_status_panel(
+                event.title,
+                event.message,
+                percent=100,
+            ),
+            None,
+        )
+    return (
+        gr.update(),
+        _render_status_panel(
+            event.title,
+            event.message,
+            accent="#f87171",
+        ),
+        None,
+    )
+
+
 async def reference_generator_generate(
     main_image: Any,
     reference_image: Any,
@@ -479,7 +1288,6 @@ async def reference_generator_generate(
 ):
     del job_state
     logger.info("Workflow %s called", workflow)
-
     user_email = getattr(request, "username", None)
     if not user_email:
         yield (
@@ -494,471 +1302,126 @@ async def reference_generator_generate(
         return
 
     identity = auth_service.get_identity(user_email)
-    is_admin_user = str(getattr(identity, "role", "") or "").strip().lower() == "admin"
     user_agent = _request_header(request, "user-agent")
     session_id = auth_service.session_key(identity.email, user_agent)
-    source_page = "/tab/reference-generator"
-
-    if main_image is None or reference_image is None:
-        yield (
-            gr.update(),
-            _render_status_panel(
-                "Input Error",
-                "Both Main Image and Reference Image are required.",
-                accent="#f87171",
-            ),
-            None,
-        )
-        return
-
     try:
-        prompt_path = _resolve_reference_generator_workflow_path()
-        with open(prompt_path, "r", encoding="utf-8") as fh:
-            prompt: dict[str, Any] = json.load(fh)
-    except UnicodeDecodeError:
-        with open(prompt_path, "r", encoding="cp1252") as fh:
-            prompt = json.load(fh)
-    except Exception as err:
+        context = _prepare_reference_request(
+            main_image=main_image,
+            reference_image=reference_image,
+            color_strength=color_strength,
+            creativity=creativity,
+            structure_strength=structure_strength,
+            enhancement_enabled=enhancement_enabled,
+            color_match_enabled=color_match_enabled,
+            workflow_debug=workflow_debug,
+            workflow=workflow,
+            identity=identity,
+            user_agent=user_agent,
+            session_id=session_id,
+        )
+    except ReferencePreparationError as err:
         yield (
             gr.update(),
-            _render_status_panel("Workflow Error", f"Prompt load failed: {err}", accent="#f87171"),
+            _render_status_panel(err.title, str(err), accent="#f87171"),
+            None,
+        )
+        return
+    except ReferenceRequestError as err:
+        yield (
+            gr.update(),
+            _render_status_panel(err.title, str(err), accent="#f87171"),
             None,
         )
         return
 
-    try:
-        main_pil = _to_pil_image(main_image)
-        reference_pil = _to_pil_image(reference_image)
-        if main_pil.mode not in ("RGB", "RGBA"):
-            main_pil = main_pil.convert("RGB")
-        if reference_pil.mode not in ("RGB", "RGBA"):
-            reference_pil = reference_pil.convert("RGB")
-    except Exception as err:
-        yield (
-            gr.update(),
-            _render_status_panel("Input Error", f"Image preparation failed: {err}", accent="#f87171"),
-            None,
-        )
-        return
-
-    try:
-        main_transport_pil = _resize_for_runpod_transport(main_pil)
-        reference_transport_pil = _resize_for_runpod_transport(reference_pil)
-        main_image_b64 = save_input_image_as_base64(main_transport_pil)
-        reference_image_b64 = save_input_image_as_base64(reference_transport_pil)
-    except Exception as err:
-        yield (
-            gr.update(),
-            _render_status_panel("Encoding Error", f"Failed to encode input images: {err}", accent="#f87171"),
-            None,
-        )
-        return
-
-    feature_flags = {
-        "enhancement_enabled": bool(enhancement_enabled),
-        "color_match_enabled": bool(color_match_enabled),
-    }
-    settings_snapshot = {
-        "color_strength": float(color_strength),
-        "creativity": float(creativity),
-        "structure_strength": float(structure_strength),
-    }
-    task_id = str(uuid.uuid4())
-    workflow_context = WorkflowContext(
-        key=str(workflow or WORKFLOW_NAME),
-        name=str(workflow or WORKFLOW_NAME),
-        version=WORKFLOW_VERSION,
-        category=WORKFLOW_CATEGORY,
-        workflow_type=WORKFLOW_TYPE,
-    )
-    tracker = TaskTracker(
-        store=None,
-        task_id=task_id,
-        user_email=identity.email,
-        user_prefix=identity.username_prefix,
-        user_display_name=identity.display_name,
-        user_role=identity.role,
-        avatar_filename=identity.avatar_filename,
-        workflow=workflow_context,
-        source_page=source_page,
-        browser_user_agent=user_agent,
-        session_id=session_id,
-        environment_name=APP_ENVIRONMENT,
-        feature_flags=feature_flags,
-        settings=settings_snapshot,
-        input_meta={
-            "width": int(main_pil.width),
-            "height": int(main_pil.height),
-            "resolution": f"{int(main_pil.width)}x{int(main_pil.height)}",
-            "format": str(main_pil.mode),
-            "reference_width": int(reference_pil.width),
-            "reference_height": int(reference_pil.height),
-        },
-        request_summary={
-            "enhancement_enabled": bool(enhancement_enabled),
-            "color_match_enabled": bool(color_match_enabled),
-        },
-        prompt_type="reference_generation",
-        created_by=identity.email,
-    )
-
-    try:
-        _apply_reference_workflow_updates(
-            prompt,
-            main_image_b64=main_image_b64,
-            reference_image_b64=reference_image_b64,
-            color_strength=float(color_strength),
-            creativity=float(creativity),
-            structure_strength=float(structure_strength),
-            enhancement_enabled=bool(enhancement_enabled),
-            color_match_enabled=bool(color_match_enabled and enhancement_enabled),
-        )
-    except KeyError as err:
-        tracker.fail(
-            failure_reason="workflow_key_missing",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
-        yield (
-            gr.update(),
-            _render_status_panel("Workflow Error", f"Workflow key missing: {err}", accent="#f87171"),
-            None,
-        )
-        return
-    except Exception as err:
-        tracker.fail(
-            failure_reason="workflow_update_error",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
-        yield (
-            gr.update(),
-            _render_status_panel("Workflow Error", f"Workflow update failed: {err}", accent="#f87171"),
-            None,
-        )
-        return
-
-    final_json = prepare_json(prompt, images=[])
-    payload_size = _json_payload_size_bytes(final_json)
-    if payload_size > REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES:
-        error_message = (
-            "The RunPod request is too large to submit "
-            f"({_format_byte_size(payload_size)}). "
-            f"The current limit is {_format_byte_size(REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES)}. "
-            "Use smaller main/reference images or lower REFERENCE_GENERATOR_MAX_UPLOAD_EDGE."
-        )
-        tracker.fail(
-            failure_reason="request_payload_too_large",
-            error_message=error_message,
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-            metadata={
-                "payload_size_bytes": payload_size,
-                "max_payload_bytes": REFERENCE_GENERATOR_MAX_PAYLOAD_BYTES,
-                "transport_main_size": list(main_transport_pil.size),
-                "transport_reference_size": list(reference_transport_pil.size),
-            },
-        )
-        yield (
-            gr.update(),
-            _render_status_panel("Input Too Large", error_message, accent="#f87171"),
-            None,
-        )
-        return
-
-    workflow_debug_path: Path | None = None
-    should_save_debug_json = bool(
-        os.getenv("SAVE_DEBUG_PROMPT_JSON", "0") == "1" or (workflow_debug and is_admin_user)
-    )
-    if should_save_debug_json:
-        try:
-            workflow_debug_path = _save_workflow_debug_json(
-                final_json,
-                workflow_name=str(workflow or WORKFLOW_NAME),
-                task_id=task_id,
-            )
-        except Exception as err:
-            logger.warning("Could not save debug prompt JSON: %s", err)
+    prepared_inputs = context.inputs
+    prepared_job = context.job
+    tracker = context.tracker
 
     api = RunpodAPI(environment=RUNPOD_ENVIRONMENT)
-    try:
-        run_resp = await api.run(final_json)
-        job_id = run_resp["id"]
-    except Exception as err:
+    submission = await _submit_reference_job(api, prepared_job.payload)
+    if submission.job_id is None:
         tracker.fail(
-            failure_reason="submission_error",
-            error_message=str(err),
+            failure_reason=(
+                "submission_uncertain"
+                if submission.uncertain
+                else "submission_error"
+            ),
+            error_message=str(submission.error_message or "Submission failed."),
             failure_stage="created",
             progress_percent=0,
             worker_id=None,
         )
         yield (
             gr.update(),
-            _render_status_panel("RunPod Error", f"Job submission failed: {err}", accent="#f87171"),
+            _render_status_panel(
+                "RunPod Submission Uncertain"
+                if submission.uncertain
+                else "RunPod Error",
+                str(submission.error_message or "Job submission failed."),
+                accent="#f59e0b" if submission.uncertain else "#f87171",
+            ),
             None,
         )
         return
 
+    job_id = submission.job_id
     tracker.attach_request(
         request_id=job_id,
         task_url=f"{api.base_url}/status/{job_id}",
         retry_count=0,
     )
-
     submitted_message = "Preparing images"
-    if workflow_debug_path is not None:
-        submitted_message += f"\n\nDebug JSON saved: {workflow_debug_path}"
-    yield gr.update(), _render_status_panel("Preparing images", submitted_message, percent=3), job_id
-
-    left_path = _save_temp_image(main_pil, prefix="reference_generator_main")
-    progress_tracker = _init_reference_progress_tracker(
-        enhancement_enabled=bool(enhancement_enabled),
-        color_match_enabled=bool(color_match_enabled and enhancement_enabled),
-    )
-    progress_tracker["current_status"] = "Job submitted. Waiting for worker updates..."
-    last_progress_text: str | None = None
-    last_runpod_progress: int | float | None = None
-    last_overall_percent = 3
-    consecutive_status_errors = 0
-    stream_seen_signatures: set[str] = set()
-    stream_seen_order: list[str] = []
-    stream_task: asyncio.Task[dict[str, Any]] | None = None
-
-    def _cancel_stream_task() -> None:
-        nonlocal stream_task
-        if stream_task is not None and not stream_task.done():
-            stream_task.cancel()
-
-    for poll_idx in range(MAX_STATUS_POLLS):
-        stream_progress_entries: list[tuple[int | float | None, str, list[str]]] = []
-        if RUNPOD_STREAM_ENABLED:
-            if stream_task is not None and stream_task.done():
-                try:
-                    stream_response = stream_task.result()
-                    stream_progress_entries, _ = _extract_stream_progress_signals(
-                        stream_response,
-                        seen_signatures=stream_seen_signatures,
-                        seen_order=stream_seen_order,
-                    )
-                except Exception as err:
-                    logger.debug("RunPod stream poll failed: %s", err)
-                finally:
-                    stream_task = None
-
-            if stream_task is None:
-                stream_task = asyncio.create_task(api.stream(job_id))
-
-        try:
-            status = await api.status(job_id)
-        except Exception as err:
-            consecutive_status_errors += 1
-            if consecutive_status_errors > MAX_CONSECUTIVE_STATUS_ERRORS:
-                tracker.fail(
-                    failure_reason="status_error",
-                    error_message=str(err),
-                    failure_stage="processing",
-                    progress_percent=int(last_runpod_progress or 0),
-                    worker_id=None,
-                )
-                yield (
-                    gr.update(),
-                    _render_status_panel("RunPod Error", f"Failed to check job status: {err}", accent="#f87171"),
-                    None,
-                )
-                _cancel_stream_task()
-                return
-
-            yield (
-                gr.update(),
-                _render_status_panel(
-                    "Temporary Connection Issue",
-                    (
-                        "Retrying while checking RunPod status.\n\n"
-                        f"{consecutive_status_errors}/{MAX_CONSECUTIVE_STATUS_ERRORS}\n\n{err}"
-                    ),
-                    percent=last_overall_percent,
-                    accent="#f59e0b",
-                ),
-                job_id,
-            )
-            await asyncio.sleep(RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S)
-            continue
-
-        consecutive_status_errors = 0
-        state = (status.get("status") or "UNKNOWN").upper()
-        has_final_output = _has_final_output_payload(status)
-
-        if state in TERMINAL_FAILURES:
-            error_message = _extract_error_message(status)
-            tracker.fail(
-                failure_reason=f"runpod_{state.lower()}",
-                error_message=error_message,
-                failure_stage="processing",
-                progress_percent=int(last_runpod_progress or 0),
-                worker_id=status.get("workerId"),
-                metadata={"runpod_state": state},
-            )
-            yield (
-                gr.update(),
-                _render_status_panel("RunPod Error", error_message, accent="#f87171"),
-                None,
-            )
-            _cancel_stream_task()
-            return
-
-        if state == "COMPLETED" or has_final_output:
-            try:
-                result_image = await _decode_output_image(status)
-            except Exception as err:
-                tracker.fail(
-                    failure_reason="decode_error",
-                    error_message=str(err),
-                    failure_stage="output_collecting",
-                    progress_percent=max(int(last_runpod_progress or 0), 96),
-                    worker_id=status.get("workerId"),
-                )
-                yield (
-                    gr.update(),
-                    _render_status_panel("Decode Error", f"Failed to decode image: {err}", accent="#f87171"),
-                    None,
-                )
-                _cancel_stream_task()
-                return
-
-            right_path = _save_temp_image(result_image, prefix="reference_generator_output")
-            artifacts = extract_artifacts_from_status(status)
-            thumbnail_path = tracker.add_thumbnail(image=result_image, output_index=0)
-            preview_path = tracker.add_preview(image=result_image, output_index=0)
-            tracker.add_output_record(
-                output_index=0,
-                result_url=artifacts.get("result_url"),
-                thumbnail_url=thumbnail_path,
-                preview_url=preview_path,
-                file_name=artifacts.get("output_filename") or right_path.name,
-                width=result_image.width,
-                height=result_image.height,
-            )
-            tracker.complete(
-                result_url=artifacts.get("result_url"),
-                thumbnail_url=thumbnail_path,
-                preview_url=preview_path,
-                output_filename=artifacts.get("output_filename") or right_path.name,
-                output_count=max(int(artifacts.get("output_count") or 0), 1),
-                output_width=result_image.width,
-                output_height=result_image.height,
-                worker_id=artifacts.get("worker_id"),
-                result_summary={
-                    "left_path": str(left_path),
-                    "right_path": str(right_path),
-                    "runpod_state": state,
-                    "enhancement_enabled": bool(enhancement_enabled),
-                    "color_match_enabled": bool(color_match_enabled),
-                },
-            )
-            yield (
-                (str(left_path), str(right_path)),
-                _render_status_panel("Image generated", "Image generated", percent=100),
-                None,
-            )
-            _cancel_stream_task()
-            return
-
-        status_runpod_progress, status_progress_text, _ = _extract_progress_signal(status)
-        progress_events: list[tuple[int | float | None, str]] = []
-        for stream_progress, stream_text, _stream_hints in stream_progress_entries:
-            progress_events.append((stream_progress, stream_text))
-        if status_progress_text:
-            progress_events.append((status_runpod_progress, status_progress_text))
-
-        effective_progress = status_runpod_progress
-        if not isinstance(effective_progress, (int, float)):
-            for stream_progress, _ in reversed(progress_events):
-                if isinstance(stream_progress, (int, float)):
-                    effective_progress = stream_progress
-                    break
-
-        for event_progress, progress_text in progress_events:
-            if progress_text:
-                last_progress_text = progress_text
-                progress_tracker.observe_text(progress_text)
-            if isinstance(event_progress, (int, float)):
-                effective_progress = event_progress
-
-        if isinstance(effective_progress, (int, float)):
-            last_runpod_progress = effective_progress
-
-        if has_final_output:
-            progress_tracker.set_stage_progress(
-                STAGE_SAVE,
-                0.98,
-                message="Finalizing output...",
-                node_id=NODE_ENHANCEMENT_IMAGE_ROUTER,
-            )
-        elif state == "IN_QUEUE":
-            progress_tracker["current_status"] = "Waiting for an available worker..."
-        elif not progress_events and state in {"IN_PROGRESS", "RUNNING"}:
-            if progress_tracker.get("current_stage") == STAGE_PREPARATION:
-                progress_tracker["current_status"] = "Waiting for next workflow update..."
-            elif last_progress_text:
-                progress_tracker["current_status"] = last_progress_text
-
-        overall_percent = max(
-            last_overall_percent,
-            progress_tracker.overall_percent(
-                runpod_progress=last_runpod_progress,
-            ),
+    if prepared_job.workflow_debug_path is not None:
+        submitted_message += (
+            f"\n\nDebug JSON saved: {prepared_job.workflow_debug_path}"
         )
-        last_overall_percent = overall_percent
-
-        if state == "IN_QUEUE":
-            status_panel = _render_reference_progress_panel(
-                progress_tracker,
-                overall_percent=max(overall_percent, 5),
-                queued=True,
-            )
-            progress_percent = max(overall_percent, 5)
-        else:
-            status_panel = _render_reference_progress_panel(
-                progress_tracker,
-                overall_percent=overall_percent,
-                queued=False,
-            )
-            progress_percent = overall_percent
-
-        tracker.emit_processing(
-            stage=str(progress_tracker.get("current_stage") or progress_tracker.get("phase") or "processing").lower(),
-            message=str(progress_tracker.get("current_status") or last_progress_text or state.replace("_", " ").title()),
-            progress_percent=progress_percent,
-            metadata={
-                "poll_idx": poll_idx,
-                "runpod_state": state,
-                "workflow": workflow,
-                "phase": progress_tracker.get("phase"),
-                "current_stage": progress_tracker.get("current_stage"),
-                "last_node_id": progress_tracker.get("last_node_id"),
-            },
-        )
-        yield gr.update(), status_panel, job_id
-        await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
-
-    tracker.fail(
-        failure_reason="timeout",
-        error_message="Timed out waiting for RunPod completion status.",
-        failure_stage="processing",
-        progress_percent=int(last_runpod_progress or 0),
-        worker_id=None,
-    )
     yield (
         gr.update(),
-        _render_status_panel("Timeout", "Timed out waiting for RunPod completion status.", accent="#f87171"),
-        None,
+        _render_status_panel(
+            "Preparing images",
+            submitted_message,
+            percent=3,
+        ),
+        job_id,
     )
-    _cancel_stream_task()
+
+    left_path = _save_temp_image(
+        prepared_inputs.main_pil,
+        prefix="reference_generator_main",
+    )
+    poll_state = ReferencePollState(
+        progress_tracker=_init_reference_progress_tracker(
+            enhancement_enabled=bool(enhancement_enabled),
+            color_match_enabled=bool(
+                color_match_enabled and enhancement_enabled
+            ),
+        )
+    )
+    poll_state.progress_tracker["current_status"] = (
+        "Job submitted. Waiting for worker updates..."
+    )
+    async for event in _poll_reference_job(
+        api,
+        job_id,
+        left_path=left_path,
+        state=poll_state,
+    ):
+        _record_reference_poll_event(
+            tracker,
+            event,
+            progress_tracker=poll_state.progress_tracker,
+            enhancement_enabled=enhancement_enabled,
+            color_match_enabled=color_match_enabled,
+            workflow=workflow,
+        )
+        yield _render_reference_poll_event(
+            event,
+            poll_state,
+            job_id=job_id,
+        )
+        if event.kind not in {"progress", "retry"}:
+            return
 
 
 async def cancel_job(job_id: str | None) -> str:
