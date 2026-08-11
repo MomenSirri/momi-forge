@@ -9,18 +9,65 @@ from typing import Any
 import requests
 from requests.exceptions import (
     ChunkedEncodingError,
+    ConnectTimeout as RequestsConnectTimeout,
     ConnectionError as RequestsConnectionError,
     RequestException,
     SSLError,
     Timeout as RequestsTimeout,
+)
+from urllib3.exceptions import (
+    ConnectTimeoutError as Urllib3ConnectTimeoutError,
+    NewConnectionError,
 )
 from dotenv import load_dotenv
 
 load_dotenv()
 
 RUNPOD_GET_RETRIES = int(os.getenv("RUNPOD_GET_RETRIES", "5"))
+RUNPOD_RUN_CONNECT_ATTEMPTS = int(os.getenv("RUNPOD_RUN_CONNECT_ATTEMPTS", "3"))
 RUNPOD_RETRY_BACKOFF_S = float(os.getenv("RUNPOD_RETRY_BACKOFF_S", "1.0"))
 RUNPOD_ERROR_BODY_MAX_CHARS = int(os.getenv("RUNPOD_ERROR_BODY_MAX_CHARS", "1200"))
+
+
+class RunpodSubmissionError(RuntimeError):
+    """A RunPod submission failed before a job ID was returned."""
+
+
+class RunpodSubmissionUncertainError(RunpodSubmissionError):
+    """RunPod may have accepted the job even though no job ID was returned."""
+
+
+def _iter_exception_chain(error: BaseException):
+    """Yield nested transport errors without depending on their string form."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+
+    while pending:
+        current = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        yield current
+
+        for attribute in ("reason", "original_error", "__cause__", "__context__"):
+            nested = getattr(current, attribute, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+
+        for argument in getattr(current, "args", ()):
+            if isinstance(argument, BaseException):
+                pending.append(argument)
+
+
+def _is_pre_send_connection_failure(error: BaseException) -> bool:
+    """Return true only when the request could not have reached RunPod."""
+    safe_errors = (
+        RequestsConnectTimeout,
+        Urllib3ConnectTimeoutError,
+        NewConnectionError,
+    )
+    return any(isinstance(item, safe_errors) for item in _iter_exception_chain(error))
 
 
 class RunpodAPI:
@@ -98,7 +145,11 @@ class RunpodAPI:
                 ) as err:
                     last_error = err
                     is_last_attempt = attempt >= max_attempts
-                    if is_last_attempt:
+                    is_safe_retry = (
+                        method.upper() == "GET"
+                        or _is_pre_send_connection_failure(err)
+                    )
+                    if is_last_attempt or not is_safe_retry:
                         raise
                     sleep_s = RUNPOD_RETRY_BACKOFF_S * attempt
                     sleep(sleep_s)
@@ -117,7 +168,32 @@ class RunpodAPI:
             return json.load(file)
 
     async def run(self, json_data: dict[str, Any]) -> dict[str, Any]:
-        return await self._request_json("POST", "/run", json_body=json_data, timeout=60)
+        attempts = max(1, RUNPOD_RUN_CONNECT_ATTEMPTS)
+        try:
+            return await self._request_json(
+                "POST",
+                "/run",
+                json_body=json_data,
+                timeout=60,
+                retries=attempts,
+            )
+        except (
+            SSLError,
+            RequestsConnectionError,
+            RequestsTimeout,
+            ChunkedEncodingError,
+        ) as err:
+            if _is_pre_send_connection_failure(err):
+                raise RunpodSubmissionError(
+                    f"Could not connect to RunPod after {attempts} attempt(s). "
+                    "The job was not submitted; please try again."
+                ) from err
+
+            raise RunpodSubmissionUncertainError(
+                "The connection to RunPod dropped before a job ID was received. "
+                "RunPod may still have accepted the job. Check the RunPod Jobs page "
+                "before retrying to avoid a duplicate billable job."
+            ) from err
 
     async def status(self, job_id: str) -> dict[str, Any]:
         cache_buster = int(time() * 1000)
