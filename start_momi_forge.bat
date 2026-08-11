@@ -20,11 +20,34 @@ set "RUNPOD_MANAGEMENT_DIST_DIR=%RUNPOD_MANAGEMENT_ROOT%\webapp\frontend\dist"
 set "RUNPOD_MANAGEMENT_API_PORT=8843"
 set "RUNPOD_MANAGEMENT_API_UPSTREAM_URL=https://127.0.0.1:%RUNPOD_MANAGEMENT_API_PORT%"
 set "APP_PUBLIC_HOST="
-set "HISTORY_PORTAL_SSO_SECRET=momi-forge-local-sso-secret"
 set "APP_SCHEME=http"
 if exist "%APP_SSL_CERTFILE%" if exist "%APP_SSL_KEYFILE%" set "APP_SCHEME=https"
 set "WEBAPP_ORIGIN=%APP_SCHEME%://127.0.0.1:%APP_SERVER_PORT%"
 set "WEBAPP_API_PORT=%RUNPOD_MANAGEMENT_API_PORT%"
+
+rem The Python app and both Node services must sign portal tokens with the same
+rem value. .env is the single source of truth; the Node services only see it if
+rem this script exports it, because they do not read .env themselves.
+set "HISTORY_PORTAL_SSO_SECRET="
+if exist "%ROOT%\.env" (
+  for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%ROOT%\.env") do (
+    if /i "%%A"=="HISTORY_PORTAL_SSO_SECRET" set "HISTORY_PORTAL_SSO_SECRET=%%~B"
+  )
+)
+if not defined HISTORY_PORTAL_SSO_SECRET (
+  echo [momi] ERROR: HISTORY_PORTAL_SSO_SECRET is not set in "%ROOT%\.env"
+  echo [momi] It signs the history portal and RunPod management access tokens.
+  echo [momi] Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+  pause
+  exit /b 1
+)
+if /i "%HISTORY_PORTAL_SSO_SECRET%"=="momi-forge-local-sso-secret" (
+  echo [momi] ERROR: HISTORY_PORTAL_SSO_SECRET is still the public placeholder value.
+  echo [momi] Anyone could forge an admin portal token with it. Replace it with:
+  echo [momi] python -c "import secrets; print(secrets.token_urlsafe(32))"
+  pause
+  exit /b 1
+)
 
 for /f "delims=" %%I in ('powershell -NoProfile -Command "$ip=''; $route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1; if ($route) { $ip = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254*' } | Select-Object -First 1 -ExpandProperty IPAddress }; if (-not $ip) { $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254*' } | Select-Object -First 1 -ExpandProperty IPAddress }; if ($ip) { $ip }"') do set "APP_PUBLIC_HOST=%%I"
 echo.

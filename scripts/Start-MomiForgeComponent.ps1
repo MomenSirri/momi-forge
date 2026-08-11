@@ -60,6 +60,66 @@ function Assert-Directory {
     }
 }
 
+function Get-DotEnvValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) {
+            continue
+        }
+
+        $pair = $trimmed -split '=', 2
+        if ($pair.Count -eq 2 -and $pair[0].Trim() -eq $Name) {
+            return $pair[1].Trim().Trim('"').Trim("'")
+        }
+    }
+
+    return $null
+}
+
+function Resolve-PortalSigningSecret {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root
+    )
+
+    # The Python app and both Node services must sign portal tokens with the
+    # same value, and .env is the single source of truth for it.
+    $secret = if ($env:HISTORY_PORTAL_SSO_SECRET) { $env:HISTORY_PORTAL_SSO_SECRET.Trim() } else { $null }
+    if (-not $secret) {
+        $secret = Get-DotEnvValue -Path (Join-Path $Root '.env') -Name 'HISTORY_PORTAL_SSO_SECRET'
+    }
+
+    if (-not $secret) {
+        throw @'
+HISTORY_PORTAL_SSO_SECRET is not set in .env. It signs the history portal and
+RunPod management access tokens, so the services refuse to start without it.
+Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+'@
+    }
+
+    if ($secret -eq 'momi-forge-local-sso-secret') {
+        throw @'
+HISTORY_PORTAL_SSO_SECRET is still the placeholder that shipped in the
+repository. That value is public, so anyone could forge an admin portal token.
+Replace it with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+'@
+    }
+
+    return $secret
+}
+
 Assert-File -Path $pythonExe -Label 'Python virtual environment executable'
 Assert-File -Path (Join-Path $root 'app.py') -Label 'Momi Forge app entry point'
 Assert-File -Path (Join-Path $historyDir 'server.js') -Label 'History Portal entry point'
@@ -85,7 +145,7 @@ $env:HISTORY_PORTAL_HOST = '0.0.0.0'
 $env:HISTORY_PORTAL_PORT = '8199'
 $env:HISTORY_PORTAL_URL = 'http://127.0.0.1:8199'
 $env:HISTORY_PORTAL_USE_PROXY = '1'
-$env:HISTORY_PORTAL_SSO_SECRET = 'momi-forge-local-sso-secret'
+$env:HISTORY_PORTAL_SSO_SECRET = Resolve-PortalSigningSecret -Root $root
 $env:RUNPOD_MANAGEMENT_ROOT = Join-Path $root 'runpod_management'
 $env:RUNPOD_MANAGEMENT_BACKEND_DIR = $runPodBackendDir
 $env:RUNPOD_MANAGEMENT_DIST_DIR = $runPodDistDir

@@ -3,8 +3,6 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
 import html
-import hashlib
-import hmac
 import mimetypes
 import os
 import re
@@ -30,6 +28,7 @@ from General_Enhancement_v04 import General_Enhancement_interface
 from analytics_store import get_analytics_store
 from auth_service import COMPANY_DOMAIN, get_auth_service
 from flux2_klein_image_edit_9b_distilled import flux2_klein_interface
+import portal_auth
 from reference_generator import reference_generator_interface
 from runpod_status_gadget import (
     RUNPOD_STATUS_GADGET_REFRESH_S,
@@ -57,8 +56,9 @@ SPLASH_ASSETS_DIR = Path(__file__).resolve().parent / "splash_assets"
 HISTORY_PORTAL_URL = os.getenv("HISTORY_PORTAL_URL", "http://localhost:8199").strip()
 HISTORY_PORTAL_PROXY_PATH = os.getenv("HISTORY_PORTAL_PROXY_PATH", "/history-proxy").strip() or "/history-proxy"
 HISTORY_PORTAL_USE_PROXY = os.getenv("HISTORY_PORTAL_USE_PROXY", "1").strip().lower() in {"1", "true", "yes", "on"}
-HISTORY_PORTAL_SSO_SECRET = os.getenv("HISTORY_PORTAL_SSO_SECRET", "momi-forge-local-sso-secret").strip()
+HISTORY_PORTAL_SSO_SECRET = os.getenv("HISTORY_PORTAL_SSO_SECRET", "").strip()
 HISTORY_PORTAL_SSO_TTL_SECONDS = max(60, int(os.getenv("HISTORY_PORTAL_SSO_TTL_SECONDS", "900")))
+HISTORY_PORTAL_COOKIE_NAME = "momi_history_portal"
 RUNPOD_MANAGEMENT_PROXY_PATH = os.getenv("RUNPOD_MANAGEMENT_PROXY_PATH", "/runpod-management").strip() or "/runpod-management"
 RUNPOD_MANAGEMENT_URL = os.getenv("RUNPOD_MANAGEMENT_URL", RUNPOD_MANAGEMENT_PROXY_PATH).strip()
 RUNPOD_MANAGEMENT_DIST_DIR = Path(
@@ -72,7 +72,14 @@ RUNPOD_MANAGEMENT_COOKIE_NAME = "momi_runpod_management"
 RUNPOD_MANAGEMENT_SSO_TTL_SECONDS = max(60, int(os.getenv("RUNPOD_MANAGEMENT_SSO_TTL_SECONDS", str(HISTORY_PORTAL_SSO_TTL_SECONDS))))
 RUNPOD_MANAGEMENT_ROLES = {"admin", "ex"}
 ADMIN_ANALYTICS_ROLES = {"admin", "ex"}
-RUNPOD_BILLING_EMAILS = {"momen.sirri@brickvisual.com"}
+RUNPOD_BILLING_EMAILS = {
+    email
+    for email in (
+        item.strip().lower()
+        for item in os.getenv("RUNPOD_BILLING_EMAILS", "momen.sirri@brickvisual.com").split(",")
+    )
+    if email
+}
 RUNPOD_REST_API_BASE = os.getenv("RUNPOD_REST_API_BASE", "https://rest.runpod.io/v1").strip().rstrip("/")
 RUNPOD_GRAPHQL_API_URL = os.getenv("RUNPOD_GRAPHQL_API_URL", "https://api.runpod.io/graphql").strip()
 RUNPOD_BILLING_TIMEOUT_S = float(os.getenv("RUNPOD_BILLING_TIMEOUT_S", "20"))
@@ -1114,6 +1121,11 @@ def _history_portal_upstream_base_url() -> str:
     return f"{scheme}://127.0.0.1:{port}"
 
 
+def _history_portal_url_signature(email: str, exp: int, nonce: str) -> str:
+    """Signature scheme the upstream history server validates. Do not change."""
+    return portal_auth.sign(HISTORY_PORTAL_SSO_SECRET, email, exp, nonce)
+
+
 def _build_history_portal_sso_url(email: str | None, base_url: str | None = None) -> str:
     base_url = (base_url or HISTORY_PORTAL_URL).rstrip("/")
     normalized_email = (email or "").strip().lower()
@@ -1124,47 +1136,101 @@ def _build_history_portal_sso_url(email: str | None, base_url: str | None = None
 
     exp = int(time.time()) + HISTORY_PORTAL_SSO_TTL_SECONDS
     nonce = secrets.token_urlsafe(12)
-    payload = f"{normalized_email}\n{exp}\n{nonce}"
-    sig = hmac.new(
-        HISTORY_PORTAL_SSO_SECRET.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
     query = urlencode(
         {
             "email": normalized_email,
             "exp": exp,
             "nonce": nonce,
-            "sig": sig,
+            "sig": _history_portal_url_signature(normalized_email, exp, nonce),
         }
     )
     return f"{base_url}/?{query}"
 
 
+def _verify_history_portal_url_token(
+    email: str | None,
+    exp: int | str | None,
+    nonce: str | None,
+    sig: str | None,
+) -> str | None:
+    """Return the signed-for email when the entry token is valid."""
+    normalized_email = (email or "").strip().lower()
+    exp_int = portal_auth.coerce_expiry(exp)
+    if not normalized_email or exp_int is None or not nonce or not sig:
+        return None
+    if portal_auth.is_expired(exp_int):
+        return None
+    expected = _history_portal_url_signature(normalized_email, exp_int, str(nonce))
+    return normalized_email if portal_auth.signature_matches(expected, sig) else None
+
+
+def _history_portal_cookie_signature(email: str, exp: int, nonce: str) -> str:
+    return portal_auth.sign(HISTORY_PORTAL_SSO_SECRET, "history-portal-session", email, exp, nonce)
+
+
+def _issue_history_portal_cookie(email: str) -> str:
+    normalized_email = (email or "").strip().lower()
+    exp = int(time.time()) + HISTORY_PORTAL_SSO_TTL_SECONDS
+    nonce = secrets.token_urlsafe(12)
+    sig = _history_portal_cookie_signature(normalized_email, exp, nonce)
+    return portal_auth.pack_token(normalized_email, exp, nonce, sig)
+
+
+def _verify_history_portal_cookie(value: str | None) -> str | None:
+    """Return the email carried by a valid, unexpired session cookie."""
+    fields = portal_auth.unpack_token(value, 4)
+    if fields is None:
+        return None
+
+    email, exp_text, nonce, sig = fields
+    normalized_email = email.strip().lower()
+    exp_int = portal_auth.coerce_expiry(exp_text)
+    if not normalized_email or exp_int is None or portal_auth.is_expired(exp_int):
+        return None
+    expected = _history_portal_cookie_signature(normalized_email, exp_int, nonce)
+    return normalized_email if portal_auth.signature_matches(expected, sig) else None
+
+
+def _authorize_history_proxy_request(request: Request) -> str | None:
+    """Authorize a proxied history request via entry token or session cookie."""
+    query = request.query_params
+    email = _verify_history_portal_url_token(
+        query.get("email"),
+        query.get("exp"),
+        query.get("nonce"),
+        query.get("sig"),
+    )
+    if email:
+        return email
+
+    return _verify_history_portal_cookie(request.cookies.get(HISTORY_PORTAL_COOKIE_NAME))
+
+
 def _runpod_management_signature(email: str, role: str, exp: int, nonce: str) -> str:
-    payload = f"runpod-management\n{email}\n{_normalize_role(role)}\n{exp}\n{nonce}"
-    return hmac.new(
-        HISTORY_PORTAL_SSO_SECRET.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    return portal_auth.sign(
+        HISTORY_PORTAL_SSO_SECRET,
+        "runpod-management",
+        email,
+        _normalize_role(role),
+        exp,
+        nonce,
+    )
 
 
 def _pack_runpod_management_cookie(email: str, role: str, exp: int, nonce: str, sig: str) -> str:
-    raw = f"{email}\n{_normalize_role(role)}\n{exp}\n{nonce}\n{sig}".encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return portal_auth.pack_token(email, _normalize_role(role), exp, nonce, sig)
 
 
 def _unpack_runpod_management_cookie(value: str | None) -> tuple[str, str, int, str, str] | None:
-    if not value:
+    fields = portal_auth.unpack_token(value, 5)
+    if fields is None:
         return None
-    try:
-        padded = value + "=" * (-len(value) % 4)
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-        email, role, exp_text, nonce, sig = decoded.split("\n", 4)
-        return email, _normalize_role(role), int(exp_text), nonce, sig
-    except Exception:
+
+    email, role, exp_text, nonce, sig = fields
+    exp_int = portal_auth.coerce_expiry(exp_text)
+    if exp_int is None:
         return None
+    return email, _normalize_role(role), exp_int, nonce, sig
 
 
 def _verify_runpod_management_token(
@@ -1176,16 +1242,13 @@ def _verify_runpod_management_token(
 ) -> bool:
     normalized_email = (email or "").strip().lower()
     normalized_role = _normalize_role(role)
-    if not normalized_email or not _can_view_runpod_management(normalized_role) or not exp or not nonce or not sig:
+    if not normalized_email or not _can_view_runpod_management(normalized_role) or not nonce or not sig:
         return False
-    try:
-        exp_int = int(exp)
-    except (TypeError, ValueError):
-        return False
-    if exp_int < int(time.time()):
+    exp_int = portal_auth.coerce_expiry(exp)
+    if exp_int is None or portal_auth.is_expired(exp_int):
         return False
     expected = _runpod_management_signature(normalized_email, normalized_role, exp_int, nonce)
-    return hmac.compare_digest(expected, str(sig))
+    return portal_auth.signature_matches(expected, sig)
 
 
 def _current_runpod_management_role(email: str | None) -> str | None:
@@ -3044,7 +3107,15 @@ with gr.Blocks(title=APP_TITLE, css=EMBEDDED_HIDE_CSS) as app:
     )
 
 
+def _require_portal_signing_secret() -> None:
+    """Refuse to start when the portal proxies cannot be signed safely."""
+    for warning in portal_auth.validate_signing_secret(HISTORY_PORTAL_SSO_SECRET):
+        print(f"[momi] WARNING: {warning}")
+
+
 def _create_server_app() -> FastAPI:
+    _require_portal_signing_secret()
+
     server_app = FastAPI()
     proxy_path = _normalized_history_proxy_path()
     upstream_base = _history_portal_upstream_base_url().rstrip("/")
@@ -3088,6 +3159,16 @@ def _create_server_app() -> FastAPI:
     @server_app.api_route(proxy_path, methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
     @server_app.api_route(f"{proxy_path}/{{proxy_path_tail:path}}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
     async def _history_proxy(request: Request, proxy_path_tail: str = "") -> Response:
+        # These routes are siblings of the mounted Gradio app, so Gradio's auth
+        # callback never runs for them. Authorize every request explicitly.
+        access_email = _authorize_history_proxy_request(request)
+        if not access_email:
+            return Response(
+                content="History portal requires an active session. Reopen the History tab.",
+                status_code=403,
+                media_type="text/plain; charset=utf-8",
+            )
+
         target_path = f"/{(proxy_path_tail or '').lstrip('/')}"
         target_url = f"{upstream_base}{target_path}"
         if request.url.query:
@@ -3123,12 +3204,23 @@ def _create_server_app() -> FastAPI:
                 continue
             response_headers[key] = value
 
-        return Response(
+        response = Response(
             content=upstream_response.content,
             status_code=upstream_response.status_code,
             headers=response_headers,
             media_type=upstream_response.headers.get("content-type"),
         )
+        # Refresh the session on every authorized request so an open History tab
+        # keeps working past the entry token's TTL.
+        response.set_cookie(
+            HISTORY_PORTAL_COOKIE_NAME,
+            _issue_history_portal_cookie(access_email),
+            max_age=HISTORY_PORTAL_SSO_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            path=proxy_path,
+        )
+        return response
 
     @server_app.get(runpod_proxy_path)
     @server_app.get(f"{runpod_proxy_path}/")

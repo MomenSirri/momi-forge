@@ -26,7 +26,27 @@ const DEFAULT_AVATAR_FILENAME = process.env.DEFAULT_AVATAR_FILENAME || 'default_
 const SESSION_COOKIE = process.env.HISTORY_SESSION_COOKIE || 'momi_history_sid';
 const SESSION_TTL_MS = Math.max(15 * 60 * 1000, Number(process.env.HISTORY_SESSION_TTL_MS || '43200000'));
 const COOKIE_SECURE = (process.env.HISTORY_COOKIE_SECURE || '0').trim() === '1';
-const HISTORY_PORTAL_SSO_SECRET = String(process.env.HISTORY_PORTAL_SSO_SECRET || 'momi-forge-local-sso-secret').trim();
+// No fallback on purpose: a default here shipped in the repository once, which
+// made it public and forgeable. Callers must supply the secret via the
+// environment (start_momi_forge.bat and Start-MomiForgeComponent.ps1 read .env).
+const RETIRED_SSO_SECRET = 'momi-forge-local-sso-secret';
+const HISTORY_PORTAL_SSO_SECRET = String(process.env.HISTORY_PORTAL_SSO_SECRET || '').trim();
+if (!HISTORY_PORTAL_SSO_SECRET) {
+  console.error(
+    '[history] HISTORY_PORTAL_SSO_SECRET is not set. Single sign-on from the Momi Forge app ' +
+      'cannot be verified, so every portal request will be rejected. Generate a secret with: ' +
+      'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+  );
+  process.exit(1);
+}
+if (HISTORY_PORTAL_SSO_SECRET === RETIRED_SSO_SECRET) {
+  console.error(
+    '[history] HISTORY_PORTAL_SSO_SECRET is still the public placeholder value. ' +
+      'Anyone could forge a portal token with it. Replace it with: ' +
+      'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+  );
+  process.exit(1);
+}
 const STRICT_SSO_SESSION_MATCH = parseBoolean(process.env.HISTORY_STRICT_SSO_SESSION_MATCH || '1');
 
 const DEFAULT_FAVORITE_CATEGORIES = [
