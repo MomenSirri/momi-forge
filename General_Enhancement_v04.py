@@ -11,6 +11,7 @@ import os
 import random
 import tempfile
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,11 @@ from PIL import Image
 from gradio_imageslider import ImageSlider
 
 from auth_service import get_auth_service
-from runpod_api_class import RunpodAPI
+from runpod_api_class import (
+    RunpodAPI,
+    RunpodSubmissionError,
+    RunpodSubmissionUncertainError,
+)
 from task_tracking import TaskTracker, WorkflowContext, extract_artifacts_from_status
 from workflow_ui import (
     debug_checkbox_visibility_update as _debug_checkbox_visibility_update,
@@ -757,6 +762,897 @@ def _apply_general_workflow_updates(
     )
 
 
+class GeneralPreparationError(RuntimeError):
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        *,
+        failure_reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.title = title
+        self.failure_reason = failure_reason
+
+
+class GeneralRequestError(RuntimeError):
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+@dataclass
+class GeneralInputSource:
+    background_np: np.ndarray
+    mask_np: np.ndarray
+    has_drawn_mask: bool
+    task_id: str
+    workflow_key: str
+    feature_flags: dict[str, Any]
+    settings_snapshot: dict[str, Any]
+    progress_tracker: ProgressTracker
+
+
+@dataclass
+class GeneralPreparedInputs:
+    source: GeneralInputSource
+    prompt: dict[str, Any]
+    image_b64: str
+    mask_b64: str
+
+
+@dataclass
+class GeneralPreparedJob:
+    inputs: GeneralPreparedInputs
+    payload: dict[str, Any]
+    workflow_debug_path: Path | None
+
+
+@dataclass
+class GeneralRequestContext:
+    source: GeneralInputSource
+    job: GeneralPreparedJob
+    tracker: TaskTracker
+
+
+@dataclass
+class GeneralSubmissionResult:
+    job_id: str | None
+    error_message: str | None = None
+    uncertain: bool = False
+
+
+@dataclass
+class GeneralFinalizedOutput:
+    result_image: Image.Image | None = None
+    left_path: Path | None = None
+    right_path: Path | None = None
+    artifacts: dict[str, Any] | None = None
+    error_message: str | None = None
+
+
+@dataclass
+class GeneralPollEvent:
+    kind: str
+    status: dict[str, Any]
+    title: str
+    message: str
+    progress_percent: int
+    stage: str
+    poll_idx: int
+    finalized: GeneralFinalizedOutput | None = None
+    tracker_error_message: str | None = None
+
+
+@dataclass
+class GeneralPollState:
+    progress_tracker: ProgressTracker
+    last_overall_percent: int = 0
+    completion_hint_seen_at: int | None = None
+    consecutive_status_errors: int = 0
+    stream_seen_signatures: set[str] = field(default_factory=set)
+    stream_seen_order: list[str] = field(default_factory=list)
+    stream_task: asyncio.Task[dict[str, Any]] | None = None
+
+    def cancel_stream(self) -> None:
+        if self.stream_task is not None and not self.stream_task.done():
+            self.stream_task.cancel()
+
+
+def _prepare_general_source(
+    *,
+    image_editor_value: Any,
+    general_enhance: bool,
+    advance_details: bool,
+    additional_detail_pass: float,
+    sharpen: float,
+    body_enhance: bool,
+    body_enhancement_denoise: float,
+    face_enhancement_denoise: float,
+    details: float,
+    general_denoise: float,
+    custom_prompt: str,
+    workflow: str,
+) -> GeneralInputSource:
+    try:
+        background_np, mask_np, has_drawn_mask = (
+            _extract_editor_background_and_mask(image_editor_value)
+        )
+    except Exception as err:
+        raise GeneralPreparationError(
+            "Input Error",
+            str(err),
+            failure_reason="input_error",
+        ) from err
+
+    image_height, image_width = background_np.shape[:2]
+    return GeneralInputSource(
+        background_np=background_np,
+        mask_np=mask_np,
+        has_drawn_mask=has_drawn_mask,
+        task_id=str(uuid.uuid4()),
+        workflow_key=str(workflow or WORKFLOW_NAME),
+        feature_flags={
+            "general_enhance": bool(general_enhance),
+            "advance_details": bool(advance_details),
+            "body_enhance": bool(body_enhance),
+        },
+        settings_snapshot={
+            "details": float(details),
+            "general_denoise": float(general_denoise),
+            "additional_detail_pass": float(additional_detail_pass),
+            "sharpen": float(sharpen),
+            "body_enhancement_denoise": float(body_enhancement_denoise),
+            "face_enhancement_denoise": float(face_enhancement_denoise),
+            "custom_prompt": str(custom_prompt or ""),
+        },
+        progress_tracker=_init_progress_tracker(
+            image_width=image_width,
+            image_height=image_height,
+            general_enhance=general_enhance,
+            advance_details=advance_details,
+            body_enhance=body_enhance,
+        ),
+    )
+
+
+def _prepare_general_inputs(
+    source: GeneralInputSource,
+) -> GeneralPreparedInputs:
+    try:
+        image_b64 = save_input_image_as_base64(source.background_np)
+        mask_b64 = save_input_image_as_base64(source.mask_np)
+    except Exception as err:
+        raise GeneralPreparationError(
+            "Encoding Error",
+            f"Failed to encode image/mask: {err}",
+            failure_reason="input_encode_error",
+        ) from err
+
+    try:
+        prompt_path = _resolve_general_workflow_path()
+        try:
+            with open(prompt_path, "r", encoding="utf-8") as file:
+                prompt: dict[str, Any] = json.load(file)
+        except UnicodeDecodeError:
+            with open(prompt_path, "r", encoding="cp1252") as file:
+                prompt = json.load(file)
+    except Exception as err:
+        raise GeneralPreparationError(
+            "Workflow Error",
+            f"Prompt load failed: {err}",
+            failure_reason="workflow_load_error",
+        ) from err
+    return GeneralPreparedInputs(
+        source=source,
+        prompt=prompt,
+        image_b64=image_b64,
+        mask_b64=mask_b64,
+    )
+
+
+def _build_general_payload(
+    prepared: GeneralPreparedInputs,
+    *,
+    workflow_debug: bool,
+    is_admin_user: bool,
+) -> GeneralPreparedJob:
+    source = prepared.source
+    flags = source.feature_flags
+    settings = source.settings_snapshot
+    _apply_general_workflow_updates(
+        prepared.prompt,
+        image_b64=prepared.image_b64,
+        mask_b64=prepared.mask_b64,
+        has_drawn_mask=source.has_drawn_mask,
+        general_enhance=bool(flags["general_enhance"]),
+        advance_details=bool(flags["advance_details"]),
+        additional_detail_pass=float(settings["additional_detail_pass"]),
+        sharpen=float(settings["sharpen"]),
+        body_enhance=bool(flags["body_enhance"]),
+        body_enhancement_denoise=float(
+            settings["body_enhancement_denoise"]
+        ),
+        face_enhancement_denoise=float(
+            settings["face_enhancement_denoise"]
+        ),
+        details=float(settings["details"]),
+        general_denoise=float(settings["general_denoise"]),
+        custom_prompt=str(settings["custom_prompt"]),
+    )
+    payload = prepare_json(prepared.prompt, images=[])
+    workflow_debug_path: Path | None = None
+    if SAVE_DEBUG_PROMPT_JSON or (workflow_debug and is_admin_user):
+        try:
+            workflow_debug_path = _save_workflow_debug_json(
+                payload,
+                workflow_name=source.workflow_key,
+                task_id=source.task_id,
+            )
+        except Exception as err:
+            logger.warning("Could not save debug prompt JSON: %s", err)
+    return GeneralPreparedJob(
+        inputs=prepared,
+        payload=payload,
+        workflow_debug_path=workflow_debug_path,
+    )
+
+
+def _create_general_task_tracker(
+    source: GeneralInputSource,
+    *,
+    identity: Any,
+    user_agent: str | None,
+    session_id: str,
+) -> TaskTracker:
+    height, width = source.background_np.shape[:2]
+    return TaskTracker(
+        store=None,
+        task_id=source.task_id,
+        user_email=identity.email,
+        user_prefix=identity.username_prefix,
+        user_display_name=identity.display_name,
+        user_role=identity.role,
+        avatar_filename=identity.avatar_filename,
+        workflow=WorkflowContext(
+            key=source.workflow_key,
+            name=source.workflow_key,
+            version=WORKFLOW_VERSION,
+            category=WORKFLOW_CATEGORY,
+            workflow_type=WORKFLOW_TYPE,
+        ),
+        source_page="/tab/general-enhancement-v04",
+        browser_user_agent=user_agent,
+        session_id=session_id,
+        environment_name=APP_ENVIRONMENT,
+        feature_flags=source.feature_flags,
+        settings=source.settings_snapshot,
+        input_meta={
+            "width": int(width),
+            "height": int(height),
+            "resolution": f"{int(width)}x{int(height)}",
+            "format": str(source.background_np.dtype),
+        },
+        request_summary={
+            "has_drawn_mask": bool(source.has_drawn_mask),
+            **source.feature_flags,
+        },
+        prompt_type="general_enhancement",
+        created_by=identity.email,
+    )
+
+
+def _prepare_general_request(
+    *,
+    image_editor_value: Any,
+    general_enhance: bool,
+    advance_details: bool,
+    additional_detail_pass: float,
+    sharpen: float,
+    body_enhance: bool,
+    body_enhancement_denoise: float,
+    face_enhancement_denoise: float,
+    details: float,
+    general_denoise: float,
+    custom_prompt: str,
+    workflow_debug: bool,
+    workflow: str,
+    identity: Any,
+    user_agent: str | None,
+    session_id: str,
+) -> GeneralRequestContext:
+    source = _prepare_general_source(
+        image_editor_value=image_editor_value,
+        general_enhance=general_enhance,
+        advance_details=advance_details,
+        additional_detail_pass=additional_detail_pass,
+        sharpen=sharpen,
+        body_enhance=body_enhance,
+        body_enhancement_denoise=body_enhancement_denoise,
+        face_enhancement_denoise=face_enhancement_denoise,
+        details=details,
+        general_denoise=general_denoise,
+        custom_prompt=custom_prompt,
+        workflow=workflow,
+    )
+    tracker = _create_general_task_tracker(
+        source,
+        identity=identity,
+        user_agent=user_agent,
+        session_id=session_id,
+    )
+    try:
+        prepared = _prepare_general_inputs(source)
+        job = _build_general_payload(
+            prepared,
+            workflow_debug=workflow_debug,
+            is_admin_user=(
+                str(getattr(identity, "role", "") or "")
+                .strip()
+                .lower()
+                == "admin"
+            ),
+        )
+    except GeneralPreparationError as err:
+        tracker.fail(
+            failure_reason=err.failure_reason,
+            error_message=str(err),
+            failure_stage="preparation",
+            progress_percent=0,
+            worker_id=None,
+        )
+        raise
+    except Exception as err:
+        failure_reason = (
+            "workflow_key_missing"
+            if isinstance(err, KeyError)
+            else "workflow_update_error"
+        )
+        message = (
+            f"Workflow key missing: {err}"
+            if isinstance(err, KeyError)
+            else f"Workflow update failed: {err}"
+        )
+        tracker.fail(
+            failure_reason=failure_reason,
+            error_message=str(err),
+            failure_stage="preparation",
+            progress_percent=0,
+            worker_id=None,
+        )
+        raise GeneralRequestError("Workflow Error", message) from err
+    return GeneralRequestContext(source=source, job=job, tracker=tracker)
+
+
+async def _submit_general_job(
+    api: RunpodAPI,
+    payload: dict[str, Any],
+) -> GeneralSubmissionResult:
+    try:
+        response = await api.run(payload)
+        return GeneralSubmissionResult(job_id=str(response["id"]))
+    except RunpodSubmissionUncertainError as err:
+        return GeneralSubmissionResult(
+            job_id=None,
+            error_message=(
+                f"{err}\n\nPlease check the Jobs page before trying again; "
+                "RunPod may already have accepted this request."
+            ),
+            uncertain=True,
+        )
+    except RunpodSubmissionError as err:
+        return GeneralSubmissionResult(
+            job_id=None,
+            error_message=f"Job submission failed: {err}",
+        )
+    except Exception as err:
+        return GeneralSubmissionResult(
+            job_id=None,
+            error_message=f"Job submission failed: {err}",
+        )
+
+
+async def _finalize_general_output(
+    status: dict[str, Any],
+    *,
+    background_np: np.ndarray,
+    job_id: str,
+) -> GeneralFinalizedOutput:
+    try:
+        result_image = await _decode_output_image(status)
+        if result_image.mode not in ("RGB", "RGBA"):
+            result_image = result_image.convert("RGBA")
+        left_image = Image.fromarray(background_np)
+        if left_image.mode not in ("RGB", "RGBA"):
+            left_image = left_image.convert("RGB")
+        tmp_dir = Path(tempfile.gettempdir())
+        left_path = tmp_dir / f"{job_id}_left.png"
+        right_path = tmp_dir / f"{job_id}_right.png"
+        left_image.save(left_path, "PNG")
+        result_image.save(right_path, "PNG")
+        return GeneralFinalizedOutput(
+            result_image=result_image,
+            left_path=left_path,
+            right_path=right_path,
+            artifacts=extract_artifacts_from_status(status),
+        )
+    except Exception as err:
+        return GeneralFinalizedOutput(error_message=str(err))
+
+
+async def _advance_general_stream(
+    api: RunpodAPI,
+    job_id: str,
+    state: GeneralPollState,
+    *,
+    stream_enabled: bool,
+) -> tuple[list[tuple[int | float | None, str, list[str]]], str | None]:
+    entries: list[tuple[int | float | None, str, list[str]]] = []
+    stream_state: str | None = None
+    if not stream_enabled:
+        return entries, stream_state
+    if state.stream_task is not None and state.stream_task.done():
+        try:
+            response = state.stream_task.result()
+            entries, stream_state = _extract_stream_progress_signals(
+                response,
+                seen_signatures=state.stream_seen_signatures,
+                seen_order=state.stream_seen_order,
+            )
+        except Exception as err:
+            logger.debug("Stream poll failed: %s", err)
+        finally:
+            state.stream_task = None
+    if state.stream_task is None:
+        state.stream_task = asyncio.create_task(api.stream(job_id))
+    return entries, stream_state
+
+
+def _update_general_poll_progress(
+    status: dict[str, Any],
+    stream_entries: list[tuple[int | float | None, str, list[str]]],
+    state: GeneralPollState,
+    *,
+    poll_idx: int,
+    runpod_state: str,
+) -> GeneralPollEvent:
+    _, status_progress_text, status_hint_texts = _extract_progress_signal(status)
+    progress_events: list[str] = []
+    seen_progress_texts: set[str] = set()
+    for _, stream_text, _ in stream_entries:
+        if stream_text and stream_text not in seen_progress_texts:
+            seen_progress_texts.add(stream_text)
+            progress_events.append(stream_text)
+    if status_progress_text and status_progress_text not in seen_progress_texts:
+        progress_events.append(status_progress_text)
+
+    hint_texts = list(status_hint_texts)
+    for _, _, stream_hints in stream_entries:
+        hint_texts.extend(stream_hints)
+    if any("Job completed. Returning" in text for text in hint_texts):
+        if state.completion_hint_seen_at is None:
+            state.completion_hint_seen_at = poll_idx
+
+    if progress_events:
+        for progress_text in progress_events:
+            state.progress_tracker.observe_text(progress_text)
+    elif state.completion_hint_seen_at is not None:
+        state.progress_tracker.start_wrap(
+            "Finalizing output...",
+            min_wrap_ratio=0.92,
+        )
+    elif (
+        runpod_state in ACTIVE_STATES
+        and state.progress_tracker["phase"] == PHASE_PREPARATION
+    ):
+        state.progress_tracker["current_status"] = (
+            "Waiting for next ComfyUI update..."
+        )
+
+    overall_percent = max(
+        state.last_overall_percent,
+        state.progress_tracker.overall_percent(),
+    )
+    state.last_overall_percent = overall_percent
+    message = str(
+        state.progress_tracker.get("current_status") or "Processing..."
+    )
+    stage = str(
+        state.progress_tracker.get("current_stage")
+        or state.progress_tracker.get("phase")
+        or "processing"
+    ).lower().replace(" ", "_")
+    return GeneralPollEvent(
+        kind="progress",
+        status=status,
+        title="Processing",
+        message=message,
+        progress_percent=overall_percent,
+        stage=stage,
+        poll_idx=poll_idx,
+    )
+
+
+async def _general_terminal_event(
+    status: dict[str, Any],
+    *,
+    runpod_state: str,
+    has_final_output: bool,
+    background_np: np.ndarray,
+    job_id: str,
+    poll_idx: int,
+    state: GeneralPollState,
+) -> GeneralPollEvent | None:
+    if runpod_state == "CANCELLED":
+        return GeneralPollEvent(
+            kind="cancelled",
+            status=status,
+            title="Cancelled",
+            message="Job cancelled.",
+            progress_percent=state.last_overall_percent,
+            stage=str(state.progress_tracker.get("phase") or "processing"),
+            poll_idx=poll_idx,
+            tracker_error_message="Job cancelled by user or worker.",
+        )
+    if runpod_state in TERMINAL_FAILURES:
+        message = _extract_error_message(status)
+        return GeneralPollEvent(
+            kind="terminal_failure",
+            status=status,
+            title="RunPod Error",
+            message=message,
+            progress_percent=state.last_overall_percent,
+            stage=str(state.progress_tracker.get("phase") or "processing"),
+            poll_idx=poll_idx,
+            tracker_error_message=message,
+        )
+    if runpod_state != "COMPLETED" and not has_final_output:
+        return None
+
+    finalized = await _finalize_general_output(
+        status,
+        background_np=background_np,
+        job_id=job_id,
+    )
+    if finalized.error_message and has_final_output and runpod_state != "COMPLETED":
+        state.progress_tracker.start_wrap(
+            "Finalizing output...",
+            min_wrap_ratio=0.95,
+        )
+        state.last_overall_percent = max(
+            state.last_overall_percent,
+            state.progress_tracker.overall_percent(),
+        )
+        return GeneralPollEvent(
+            kind="finalizing",
+            status=status,
+            title="Finalizing output",
+            message="Finalizing output...",
+            progress_percent=state.last_overall_percent,
+            stage="output_collecting",
+            poll_idx=poll_idx,
+        )
+    if finalized.error_message:
+        return GeneralPollEvent(
+            kind="decode_error",
+            status=status,
+            title="Decode Error",
+            message=f"Failed to decode image: {finalized.error_message}",
+            progress_percent=state.last_overall_percent,
+            stage="output_collecting",
+            poll_idx=poll_idx,
+            finalized=finalized,
+            tracker_error_message=finalized.error_message,
+        )
+    return GeneralPollEvent(
+        kind="completed",
+        status=status,
+        title="Completed",
+        message="Completed.",
+        progress_percent=100,
+        stage="completed",
+        poll_idx=poll_idx,
+        finalized=finalized,
+    )
+
+
+async def _poll_general_job(
+    api: RunpodAPI,
+    job_id: str,
+    *,
+    background_np: np.ndarray,
+    state: GeneralPollState,
+    stream_enabled: bool = RUNPOD_STREAM_ENABLED,
+):
+    try:
+        for poll_idx in range(MAX_STATUS_POLLS):
+            stream_entries, stream_state = await _advance_general_stream(
+                api,
+                job_id,
+                state,
+                stream_enabled=stream_enabled,
+            )
+            try:
+                status = await api.status(job_id)
+            except Exception as err:
+                state.consecutive_status_errors += 1
+                if state.consecutive_status_errors > MAX_CONSECUTIVE_STATUS_ERRORS:
+                    yield GeneralPollEvent(
+                        kind="status_error",
+                        status={},
+                        title="RunPod Error",
+                        message=f"Failed to check job status: {err}",
+                        progress_percent=state.last_overall_percent,
+                        stage="status_poll",
+                        poll_idx=poll_idx,
+                        tracker_error_message=str(err),
+                    )
+                    return
+                yield GeneralPollEvent(
+                    kind="retry",
+                    status={},
+                    title="Temporary Connection Issue",
+                    message=(
+                        "Retrying automatically while checking RunPod status."
+                        f"\n\n{err}"
+                    ),
+                    progress_percent=state.last_overall_percent,
+                    stage="status_poll",
+                    poll_idx=poll_idx,
+                )
+                await asyncio.sleep(RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S)
+                continue
+
+            state.consecutive_status_errors = 0
+            runpod_state = (status.get("status") or stream_state or "").upper()
+            terminal_event = await _general_terminal_event(
+                status,
+                runpod_state=runpod_state,
+                has_final_output=_has_final_output_payload(status),
+                background_np=background_np,
+                job_id=job_id,
+                poll_idx=poll_idx,
+                state=state,
+            )
+            if terminal_event is not None:
+                yield terminal_event
+                if terminal_event.kind != "finalizing":
+                    return
+                await asyncio.sleep(RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S)
+                continue
+
+            yield _update_general_poll_progress(
+                status,
+                stream_entries,
+                state,
+                poll_idx=poll_idx,
+                runpod_state=runpod_state,
+            )
+            if (
+                state.completion_hint_seen_at is not None
+                and poll_idx - state.completion_hint_seen_at
+                >= FINALIZATION_HINT_GRACE_POLLS
+            ):
+                yield GeneralPollEvent(
+                    kind="status_lag",
+                    status=status,
+                    title="RunPod Status Lag",
+                    message=(
+                        "RunPod stayed IN_PROGRESS after a completion hint. "
+                        "Please retry or check endpoint status lag."
+                    ),
+                    progress_percent=state.last_overall_percent,
+                    stage="wrap_up",
+                    poll_idx=poll_idx,
+                    tracker_error_message=(
+                        "RunPod stayed IN_PROGRESS after completion hint."
+                    ),
+                )
+                return
+            await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
+
+        yield GeneralPollEvent(
+            kind="timeout",
+            status={},
+            title="Timed Out",
+            message="Timed out waiting for RunPod completion status.",
+            progress_percent=state.last_overall_percent,
+            stage=str(state.progress_tracker.get("phase") or "processing"),
+            poll_idx=MAX_STATUS_POLLS,
+            tracker_error_message=(
+                "Timed out waiting for RunPod completion status."
+            ),
+        )
+    finally:
+        state.cancel_stream()
+
+
+def _record_general_completed(
+    tracker: TaskTracker,
+    event: GeneralPollEvent,
+    *,
+    progress_tracker: ProgressTracker,
+) -> None:
+    finalized = event.finalized
+    if (
+        finalized is None
+        or finalized.result_image is None
+        or finalized.left_path is None
+        or finalized.right_path is None
+    ):
+        raise ValueError("Completed General event is missing finalized output.")
+    artifacts = finalized.artifacts or {}
+    tracker.mark_stage(
+        status="uploading",
+        stage="uploading",
+        message="Saving result and thumbnail artifacts...",
+        progress_percent=97,
+    )
+    thumbnail_path = tracker.add_thumbnail(
+        image=finalized.result_image,
+        output_index=0,
+    )
+    preview_path = tracker.add_preview(
+        image=finalized.result_image,
+        output_index=0,
+    )
+    output_filename = (
+        artifacts.get("output_filename") or finalized.right_path.name
+    )
+    tracker.add_output_record(
+        output_index=0,
+        result_url=artifacts.get("result_url"),
+        thumbnail_url=thumbnail_path,
+        preview_url=preview_path,
+        file_name=output_filename,
+        width=finalized.result_image.width,
+        height=finalized.result_image.height,
+    )
+    progress_tracker.mark_completed()
+    progress_tracker["current_status"] = "Completed."
+    tracker.complete(
+        result_url=artifacts.get("result_url"),
+        thumbnail_url=thumbnail_path,
+        preview_url=preview_path,
+        output_filename=output_filename,
+        output_count=max(int(artifacts.get("output_count") or 0), 1),
+        output_width=finalized.result_image.width,
+        output_height=finalized.result_image.height,
+        worker_id=artifacts.get("worker_id"),
+        result_summary={
+            "left_path": str(finalized.left_path),
+            "right_path": str(finalized.right_path),
+            "runpod_state": event.status.get("status"),
+        },
+    )
+
+
+def _record_general_poll_event(
+    tracker: TaskTracker,
+    event: GeneralPollEvent,
+    *,
+    progress_tracker: ProgressTracker,
+) -> None:
+    runpod_state = str(event.status.get("status") or "").upper()
+    if runpod_state in ACTIVE_STATES and tracker.started_dt is None:
+        tracker.mark_started(
+            message="Execution started. Waiting for ComfyUI updates..."
+        )
+    if event.kind == "retry":
+        return
+    if event.kind in {"progress", "finalizing"}:
+        if event.kind == "finalizing":
+            tracker.mark_stage(
+                status="output_collecting",
+                stage="output_collecting",
+                message="Collecting output images from ComfyUI history...",
+                progress_percent=max(event.progress_percent, 92),
+            )
+        tracker.emit_processing(
+            stage=event.stage,
+            message=event.message,
+            progress_percent=event.progress_percent,
+            node_id=extract_node_id(event.message),
+            metadata={
+                "runpod_state": event.status.get("status"),
+                "phase": progress_tracker.get("phase"),
+                "current_stage": progress_tracker.get("current_stage"),
+            },
+        )
+        return
+    if event.kind == "completed":
+        tracker.mark_stage(
+            status="output_collecting",
+            stage="output_collecting",
+            message="Collecting output images from ComfyUI history...",
+            progress_percent=max(event.progress_percent, 92),
+        )
+        _record_general_completed(
+            tracker,
+            event,
+            progress_tracker=progress_tracker,
+        )
+        return
+
+    failure_reason = {
+        "cancelled": "cancelled",
+        "status_error": "status_poll_error",
+        "terminal_failure": (
+            f"runpod_{str(event.status.get('status') or 'unknown').lower()}"
+        ),
+        "decode_error": "decode_error",
+        "status_lag": "status_lag_timeout",
+        "timeout": "polling_timeout",
+    }.get(event.kind, event.kind)
+    tracker.fail(
+        failure_reason=failure_reason,
+        error_message=event.tracker_error_message or event.message,
+        failure_stage=event.stage,
+        progress_percent=event.progress_percent,
+        worker_id=event.status.get("workerId"),
+        status="cancelled" if event.kind == "cancelled" else "failed",
+        metadata=(
+            {"runpod_state": event.status.get("status")}
+            if event.kind == "terminal_failure"
+            else None
+        ),
+    )
+
+
+def _render_general_poll_event(
+    event: GeneralPollEvent,
+    state: GeneralPollState,
+    *,
+    job_id: str,
+) -> tuple[Any, str, str | None]:
+    if event.kind in {"progress", "finalizing"}:
+        return (
+            gr.update(),
+            _render_general_progress_panel(
+                state.progress_tracker,
+                overall_percent=event.progress_percent,
+            ),
+            job_id,
+        )
+    if event.kind == "retry":
+        return (
+            gr.update(),
+            _render_general_notice_panel(
+                event.title,
+                event.message,
+                percent=event.progress_percent,
+                accent="#f59e0b",
+            ),
+            job_id,
+        )
+    if event.kind == "completed":
+        finalized = event.finalized
+        if (
+            finalized is None
+            or finalized.left_path is None
+            or finalized.right_path is None
+        ):
+            raise ValueError("Completed General event is missing output paths.")
+        return (
+            (str(finalized.left_path), str(finalized.right_path)),
+            _render_general_progress_panel(
+                state.progress_tracker,
+                overall_percent=100,
+            ),
+            None,
+        )
+    return (
+        gr.update(),
+        _render_general_notice_panel(
+            event.title,
+            event.message,
+            percent=event.progress_percent,
+            accent="#f59e0b" if event.kind == "cancelled" else "#f87171",
+        ),
+        None,
+    )
+
+
 async def enhance_image(
     image_editor_value: Any,
     general_enhance: bool,
@@ -774,7 +1670,6 @@ async def enhance_image(
     request: gr.Request,
 ):
     logger.info("Workflow %s called", workflow)
-
     user_email = getattr(request, "username", None)
     if not user_email:
         yield (
@@ -789,209 +1684,52 @@ async def enhance_image(
         return
 
     identity = auth_service.get_identity(user_email)
-    is_admin_user = str(getattr(identity, "role", "") or "").strip().lower() == "admin"
     user_agent = _request_header(request, "user-agent")
     session_id = auth_service.session_key(identity.email, user_agent)
-    source_page = "/tab/general-enhancement-v04"
-
     try:
-        background_np, mask_np, has_drawn_mask = _extract_editor_background_and_mask(image_editor_value)
-    except Exception as err:
-        yield (
-            gr.update(),
-            _render_general_notice_panel("Input Error", str(err), accent="#f87171"),
-            None,
-        )
-        return
-
-    image_height, image_width = background_np.shape[:2]
-    progress_tracker = _init_progress_tracker(
-        image_width=image_width,
-        image_height=image_height,
-        general_enhance=general_enhance,
-        advance_details=advance_details,
-        body_enhance=body_enhance,
-    )
-
-    feature_flags = {
-        "general_enhance": bool(general_enhance),
-        "advance_details": bool(advance_details),
-        "body_enhance": bool(body_enhance),
-    }
-    settings_snapshot = {
-        "details": float(details),
-        "general_denoise": float(general_denoise),
-        "additional_detail_pass": float(additional_detail_pass),
-        "sharpen": float(sharpen),
-        "body_enhancement_denoise": float(body_enhancement_denoise),
-        "face_enhancement_denoise": float(face_enhancement_denoise),
-        "custom_prompt": str(custom_prompt or ""),
-    }
-    task_id = str(uuid.uuid4())
-    workflow_name = str(workflow or WORKFLOW_NAME)
-    tracker = TaskTracker(
-        store=None,
-        task_id=task_id,
-        user_email=identity.email,
-        user_prefix=identity.username_prefix,
-        user_display_name=identity.display_name,
-        user_role=identity.role,
-        avatar_filename=identity.avatar_filename,
-        workflow=WorkflowContext(
-            key=workflow_name,
-            name=workflow_name,
-            version=WORKFLOW_VERSION,
-            category=WORKFLOW_CATEGORY,
-            workflow_type=WORKFLOW_TYPE,
-        ),
-        source_page=source_page,
-        browser_user_agent=user_agent,
-        session_id=session_id,
-        environment_name=APP_ENVIRONMENT,
-        feature_flags=feature_flags,
-        settings=settings_snapshot,
-        input_meta={
-            "width": int(image_width),
-            "height": int(image_height),
-            "resolution": f"{int(image_width)}x{int(image_height)}",
-            "format": str(background_np.dtype),
-        },
-        request_summary={
-            "has_drawn_mask": bool(has_drawn_mask),
-            "general_enhance": bool(general_enhance),
-            "advance_details": bool(advance_details),
-            "body_enhance": bool(body_enhance),
-        },
-        prompt_type="general_enhancement",
-        created_by=identity.email,
-    )
-
-    try:
-        image_b64 = save_input_image_as_base64(background_np)
-        mask_b64 = save_input_image_as_base64(mask_np)
-    except Exception as err:
-        tracker.fail(
-            failure_reason="input_encode_error",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
-        yield (
-            gr.update(),
-            _render_general_notice_panel(
-                "Encoding Error",
-                f"Failed to encode image/mask: {err}",
-                accent="#f87171",
-            ),
-            None,
-        )
-        return
-
-    try:
-        prompt_path = _resolve_general_workflow_path()
-        with open(prompt_path, "r", encoding="utf-8") as fh:
-            prompt: dict[str, Any] = json.load(fh)
-    except UnicodeDecodeError:
-        with open(prompt_path, "r", encoding="cp1252") as fh:
-            prompt = json.load(fh)
-    except Exception as err:
-        tracker.fail(
-            failure_reason="workflow_load_error",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
-        yield (
-            gr.update(),
-            _render_general_notice_panel(
-                "Workflow Error",
-                f"Prompt load failed: {err}",
-                accent="#f87171",
-            ),
-            None,
-        )
-        return
-
-    try:
-        _apply_general_workflow_updates(
-            prompt,
-            image_b64=image_b64,
-            mask_b64=mask_b64,
-            has_drawn_mask=has_drawn_mask,
+        context = _prepare_general_request(
+            image_editor_value=image_editor_value,
             general_enhance=general_enhance,
             advance_details=advance_details,
-            additional_detail_pass=float(additional_detail_pass),
-            sharpen=float(sharpen),
+            additional_detail_pass=additional_detail_pass,
+            sharpen=sharpen,
             body_enhance=body_enhance,
-            body_enhancement_denoise=float(body_enhancement_denoise),
-            face_enhancement_denoise=float(face_enhancement_denoise),
-            details=float(details),
-            general_denoise=float(general_denoise),
-            custom_prompt=str(custom_prompt or ""),
+            body_enhancement_denoise=body_enhancement_denoise,
+            face_enhancement_denoise=face_enhancement_denoise,
+            details=details,
+            general_denoise=general_denoise,
+            custom_prompt=custom_prompt,
+            workflow_debug=workflow_debug,
+            workflow=workflow,
+            identity=identity,
+            user_agent=user_agent,
+            session_id=session_id,
         )
-    except KeyError as err:
-        tracker.fail(
-            failure_reason="workflow_key_missing",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
+    except (GeneralPreparationError, GeneralRequestError) as err:
         yield (
             gr.update(),
             _render_general_notice_panel(
-                "Workflow Error",
-                f"Workflow key missing: {err}",
-                accent="#f87171",
-            ),
-            None,
-        )
-        return
-    except Exception as err:
-        tracker.fail(
-            failure_reason="workflow_update_error",
-            error_message=str(err),
-            failure_stage="preparation",
-            progress_percent=0,
-            worker_id=None,
-        )
-        yield (
-            gr.update(),
-            _render_general_notice_panel(
-                "Workflow Error",
-                f"Workflow update failed: {err}",
+                err.title,
+                str(err),
                 accent="#f87171",
             ),
             None,
         )
         return
 
-    final_json = prepare_json(prompt, images=[])
-    workflow_debug_path: Path | None = None
-
-    should_save_debug_json = bool(SAVE_DEBUG_PROMPT_JSON or (workflow_debug and is_admin_user))
-    if should_save_debug_json:
-        try:
-            workflow_debug_path = _save_workflow_debug_json(
-                final_json,
-                workflow_name=workflow_name,
-                task_id=task_id,
-            )
-            logger.info("Saved ComfyUI workflow JSON: %s", workflow_debug_path)
-        except Exception as err:
-            logger.warning("Could not save debug prompt JSON: %s", err)
-
+    source = context.source
+    tracker = context.tracker
+    prepared_job = context.job
     api = RunpodAPI(environment="General_Enhancement")
-
-    try:
-        run_resp = await api.run(final_json)
-        job_id = run_resp["id"]
-    except Exception as err:
+    submission = await _submit_general_job(api, prepared_job.payload)
+    if submission.job_id is None:
         tracker.fail(
-            failure_reason="submission_error",
-            error_message=str(err),
+            failure_reason=(
+                "submission_uncertain"
+                if submission.uncertain
+                else "submission_error"
+            ),
+            error_message=str(submission.error_message or "Submission failed."),
             failure_stage="created",
             progress_percent=0,
             worker_id=None,
@@ -1000,391 +1738,59 @@ async def enhance_image(
         yield (
             gr.update(),
             _render_general_notice_panel(
-                "RunPod Error",
-                f"Job submission failed: {err}",
-                accent="#f87171",
+                "RunPod Submission Uncertain"
+                if submission.uncertain
+                else "RunPod Error",
+                str(submission.error_message or "Job submission failed."),
+                accent="#f59e0b" if submission.uncertain else "#f87171",
             ),
             None,
         )
         return
 
+    job_id = submission.job_id
     tracker.attach_request(
         request_id=job_id,
         task_url=f"{api.base_url}/status/{job_id}",
         retry_count=0,
     )
-
-    if workflow_debug_path is not None:
-        progress_tracker["current_status"] = (
-            f"Job submitted. Debug JSON saved: {workflow_debug_path}"
+    if prepared_job.workflow_debug_path is not None:
+        source.progress_tracker["current_status"] = (
+            "Job submitted. Debug JSON saved: "
+            f"{prepared_job.workflow_debug_path}"
         )
     else:
-        progress_tracker["current_status"] = "Job submitted. Waiting for worker updates..."
+        source.progress_tracker["current_status"] = (
+            "Job submitted. Waiting for worker updates..."
+        )
     yield (
         gr.update(),
-        _render_general_progress_panel(progress_tracker, overall_percent=0),
+        _render_general_progress_panel(
+            source.progress_tracker,
+            overall_percent=0,
+        ),
         job_id,
     )
 
-    last_overall_percent = 0
-    completion_hint_seen_at: int | None = None
-    consecutive_status_errors = 0
-    stream_seen_signatures: set[str] = set()
-    stream_seen_order: list[str] = []
-    stream_task: asyncio.Task[dict[str, Any]] | None = None
-
-    def _cancel_stream_task() -> None:
-        nonlocal stream_task
-        if stream_task is not None and not stream_task.done():
-            stream_task.cancel()
-
-    for poll_idx in range(MAX_STATUS_POLLS):
-        stream_progress_entries: list[tuple[int | float | None, str, list[str]]] = []
-        stream_state: str | None = None
-
-        if RUNPOD_STREAM_ENABLED:
-            if stream_task is not None and stream_task.done():
-                try:
-                    stream_response = stream_task.result()
-                    stream_progress_entries, stream_state = _extract_stream_progress_signals(
-                        stream_response,
-                        seen_signatures=stream_seen_signatures,
-                        seen_order=stream_seen_order,
-                    )
-                except Exception as err:
-                    logger.debug("Stream poll failed: %s", err)
-                finally:
-                    stream_task = None
-
-            if stream_task is None:
-                stream_task = asyncio.create_task(api.stream(job_id))
-
-        try:
-            status = await api.status(job_id)
-        except Exception as err:
-            consecutive_status_errors += 1
-            if consecutive_status_errors > MAX_CONSECUTIVE_STATUS_ERRORS:
-                tracker.fail(
-                    failure_reason="status_poll_error",
-                    error_message=str(err),
-                    failure_stage="status_poll",
-                    progress_percent=last_overall_percent,
-                    worker_id=None,
-                    metadata={
-                        "consecutive_errors": consecutive_status_errors,
-                        "poll_idx": poll_idx,
-                    },
-                )
-                yield (
-                    gr.update(),
-                    _render_general_notice_panel(
-                        "RunPod Error",
-                        f"Failed to check job status: {err}",
-                        percent=last_overall_percent,
-                        accent="#f87171",
-                    ),
-                    None,
-                )
-                _cancel_stream_task()
-                return
-
-            yield (
-                gr.update(),
-                _render_general_notice_panel(
-                    "Temporary Connection Issue",
-                    (
-                        "Retrying automatically while checking RunPod status.\n\n"
-                        f"{err}"
-                    ),
-                    percent=last_overall_percent,
-                    accent="#f59e0b",
-                ),
-                job_id,
-            )
-            await asyncio.sleep(RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S)
-            continue
-
-        consecutive_status_errors = 0
-
-        state = (status.get("status") or stream_state or "").upper()
-        has_final_output = _has_final_output_payload(status)
-
-        if state in ACTIVE_STATES and tracker.started_dt is None:
-            tracker.mark_started(message="Execution started. Waiting for ComfyUI updates...")
-
-        if state == "CANCELLED":
-            tracker.fail(
-                failure_reason="cancelled",
-                error_message="Job cancelled by user or worker.",
-                failure_stage=str(progress_tracker.get("phase") or "processing"),
-                progress_percent=last_overall_percent,
-                worker_id=status.get("workerId"),
-                status="cancelled",
-            )
-            yield (
-                gr.update(),
-                _render_general_notice_panel(
-                    "Cancelled",
-                    "Job cancelled.",
-                    percent=last_overall_percent,
-                    accent="#f59e0b",
-                ),
-                None,
-            )
-            _cancel_stream_task()
-            return
-
-        if state in TERMINAL_FAILURES:
-            error_message = _extract_error_message(status)
-            tracker.fail(
-                failure_reason=f"runpod_{state.lower()}",
-                error_message=error_message,
-                failure_stage=str(progress_tracker.get("phase") or "processing"),
-                progress_percent=last_overall_percent,
-                worker_id=status.get("workerId"),
-                status="failed",
-                metadata={"runpod_state": state},
-            )
-            yield (
-                gr.update(),
-                _render_general_notice_panel(
-                    "RunPod Error",
-                    error_message,
-                    percent=last_overall_percent,
-                    accent="#f87171",
-                ),
-                None,
-            )
-            _cancel_stream_task()
-            return
-
-        if state == "COMPLETED" or has_final_output:
-            tracker.mark_stage(
-                status="output_collecting",
-                stage="output_collecting",
-                message="Collecting output images from ComfyUI history...",
-                progress_percent=max(last_overall_percent, 92),
-            )
-            try:
-                result_image = await _decode_output_image(status)
-                if result_image.mode not in ("RGB", "RGBA"):
-                    result_image = result_image.convert("RGBA")
-
-                left_image = Image.fromarray(background_np)
-                if left_image.mode not in ("RGB", "RGBA"):
-                    left_image = left_image.convert("RGB")
-
-                tmp_dir = Path(tempfile.gettempdir())
-                left_path = tmp_dir / f"{job_id}_left.png"
-                right_path = tmp_dir / f"{job_id}_right.png"
-
-                left_image.save(left_path, "PNG")
-                result_image.save(right_path, "PNG")
-                tracker.mark_stage(
-                    status="uploading",
-                    stage="uploading",
-                    message="Saving result and thumbnail artifacts...",
-                    progress_percent=97,
-                )
-
-                artifacts = extract_artifacts_from_status(status)
-                thumbnail_path = tracker.add_thumbnail(image=result_image, output_index=0)
-                preview_path = tracker.add_preview(image=result_image, output_index=0)
-                tracker.add_output_record(
-                    output_index=0,
-                    result_url=artifacts.get("result_url"),
-                    thumbnail_url=thumbnail_path,
-                    preview_url=preview_path,
-                    file_name=artifacts.get("output_filename") or right_path.name,
-                    width=result_image.width,
-                    height=result_image.height,
-                )
-
-                progress_tracker.mark_completed()
-                progress_tracker["current_status"] = "Completed."
-                tracker.complete(
-                    result_url=artifacts.get("result_url"),
-                    thumbnail_url=thumbnail_path,
-                    preview_url=preview_path,
-                    output_filename=artifacts.get("output_filename") or right_path.name,
-                    output_count=max(int(artifacts.get("output_count") or 0), 1),
-                    output_width=result_image.width,
-                    output_height=result_image.height,
-                    worker_id=artifacts.get("worker_id"),
-                    result_summary={
-                        "left_path": str(left_path),
-                        "right_path": str(right_path),
-                        "runpod_state": state,
-                    },
-                )
-                yield (
-                    (str(left_path), str(right_path)),
-                    _render_general_progress_panel(
-                        progress_tracker,
-                        overall_percent=100,
-                    ),
-                    None,
-                )
-                _cancel_stream_task()
-                return
-            except Exception as err:
-                if has_final_output and state != "COMPLETED":
-                    progress_tracker.start_wrap(
-                        "Finalizing output...",
-                        min_wrap_ratio=0.95,
-                    )
-                    tracker.emit_processing(
-                        stage="output_collecting",
-                        message="Finalizing output payload...",
-                        progress_percent=max(last_overall_percent, 92),
-                    )
-                    overall_percent = max(
-                        last_overall_percent,
-                        progress_tracker.overall_percent(),
-                    )
-                    last_overall_percent = overall_percent
-                    yield (
-                        gr.update(),
-                        _render_general_progress_panel(
-                            progress_tracker,
-                            overall_percent=overall_percent,
-                        ),
-                        job_id,
-                    )
-                    await asyncio.sleep(RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S)
-                    continue
-
-                yield (
-                    gr.update(),
-                    _render_general_notice_panel(
-                        "Decode Error",
-                        f"Failed to decode image: {err}",
-                        percent=last_overall_percent,
-                        accent="#f87171",
-                    ),
-                    None,
-                )
-                tracker.fail(
-                    failure_reason="decode_error",
-                    error_message=str(err),
-                    failure_stage="output_collecting",
-                    progress_percent=last_overall_percent,
-                    worker_id=status.get("workerId"),
-                )
-                _cancel_stream_task()
-                return
-
-        (
-            _status_runpod_progress,
-            status_progress_text,
-            status_hint_texts,
-        ) = _extract_progress_signal(status)
-
-        progress_events: list[str] = []
-        seen_progress_texts: set[str] = set()
-        for _stream_progress, stream_text, _stream_hints in stream_progress_entries:
-            if stream_text not in seen_progress_texts:
-                seen_progress_texts.add(stream_text)
-                progress_events.append(stream_text)
-        if status_progress_text and status_progress_text not in seen_progress_texts:
-            seen_progress_texts.add(status_progress_text)
-            progress_events.append(status_progress_text)
-
-        combined_hint_texts: list[str] = list(status_hint_texts)
-        for _, _, hint_texts in stream_progress_entries:
-            combined_hint_texts.extend(hint_texts)
-
-        if any("Job completed. Returning" in text for text in combined_hint_texts):
-            if completion_hint_seen_at is None:
-                completion_hint_seen_at = poll_idx
-
-        if progress_events:
-            for progress_text in progress_events:
-                progress_tracker.observe_text(progress_text)
-        else:
-            if completion_hint_seen_at is not None:
-                progress_tracker.start_wrap(
-                    "Finalizing output...",
-                    min_wrap_ratio=0.92,
-                )
-            elif state in ACTIVE_STATES and progress_tracker["phase"] == PHASE_PREPARATION:
-                progress_tracker["current_status"] = "Waiting for next ComfyUI update..."
-
-        overall_percent = max(
-            last_overall_percent,
-            progress_tracker.overall_percent(),
+    poll_state = GeneralPollState(progress_tracker=source.progress_tracker)
+    async for event in _poll_general_job(
+        api,
+        job_id,
+        background_np=source.background_np,
+        state=poll_state,
+    ):
+        _record_general_poll_event(
+            tracker,
+            event,
+            progress_tracker=source.progress_tracker,
         )
-        last_overall_percent = overall_percent
-        tracker.emit_processing(
-            stage=str(
-                progress_tracker.get("current_stage")
-                or progress_tracker.get("phase")
-                or "processing"
-            )
-            .lower()
-            .replace(" ", "_"),
-            message=str(progress_tracker.get("current_status") or "Processing..."),
-            progress_percent=overall_percent,
-            node_id=extract_node_id(str(progress_tracker.get("current_status") or "")),
-            metadata={
-                "runpod_state": state,
-                "phase": progress_tracker.get("phase"),
-                "current_stage": progress_tracker.get("current_stage"),
-            },
+        yield _render_general_poll_event(
+            event,
+            poll_state,
+            job_id=job_id,
         )
-        yield (
-            gr.update(),
-            _render_general_progress_panel(
-                progress_tracker,
-                overall_percent=overall_percent,
-            ),
-            job_id,
-        )
-
-        if (
-            completion_hint_seen_at is not None
-            and poll_idx - completion_hint_seen_at >= FINALIZATION_HINT_GRACE_POLLS
-        ):
-            tracker.fail(
-                failure_reason="status_lag_timeout",
-                error_message="RunPod stayed IN_PROGRESS after completion hint.",
-                failure_stage="wrap_up",
-                progress_percent=last_overall_percent,
-                worker_id=status.get("workerId"),
-            )
-            yield (
-                gr.update(),
-                _render_general_notice_panel(
-                    "RunPod Status Lag",
-                    "RunPod stayed IN_PROGRESS after a completion hint. Please retry or check endpoint status lag.",
-                    percent=last_overall_percent,
-                    accent="#f87171",
-                ),
-                None,
-            )
-            _cancel_stream_task()
+        if event.kind not in {"progress", "retry", "finalizing"}:
             return
-
-        await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
-
-    yield (
-        gr.update(),
-        _render_general_notice_panel(
-            "Timed Out",
-            "Timed out waiting for RunPod completion status.",
-            percent=last_overall_percent,
-            accent="#f87171",
-        ),
-        None,
-    )
-    tracker.fail(
-        failure_reason="polling_timeout",
-        error_message="Timed out waiting for RunPod completion status.",
-        failure_stage=str(progress_tracker.get("phase") or "processing"),
-        progress_percent=last_overall_percent,
-        worker_id=None,
-    )
-    _cancel_stream_task()
 
 
 async def cancel_job(job_id: str | None) -> str:
