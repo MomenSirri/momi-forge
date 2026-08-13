@@ -39,6 +39,7 @@ from workflow_ui import (
 )
 from workflow_progress import (
     COUNT_MODE_CYCLE,
+    COUNT_MODE_FRACTION_DIRECT,
     COUNT_MODE_ITEM_COUNTER,
     PHASE_COMPLETED,
     PHASE_PREPARATION,

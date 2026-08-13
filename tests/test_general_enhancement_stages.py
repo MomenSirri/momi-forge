@@ -69,6 +69,20 @@ class GeneralPayloadPreparationTests(unittest.TestCase):
         )
 
 
+class GeneralProgressDisplayTests(unittest.TestCase):
+    def test_fraction_direct_stage_has_a_provisional_total_while_running(self) -> None:
+        stage = {
+            "enabled": True,
+            "count_mode": general.COUNT_MODE_FRACTION_DIRECT,
+            "total": None,
+            "done": 0,
+            "started": True,
+            "finished": False,
+        }
+
+        self.assertEqual(general._effective_stage_total(stage), 1)
+
+
 class GeneralJobStageTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_submission_points_to_jobs_without_retry(self) -> None:
         class UncertainAPI:
