@@ -72,7 +72,7 @@ APP_DEBUG = os.getenv("APP_DEBUG", "0").strip().lower() in {"1", "true", "yes", 
 APP_QUIET = os.getenv("APP_QUIET", "1").strip().lower() in {"1", "true", "yes", "on"}
 RUNPOD_STATUS_POLL_INTERVAL_S = max(
     0.1,
-    float(os.getenv("RUNPOD_STATUS_POLL_INTERVAL_S", "0.4")),
+    float(os.getenv("RUNPOD_STATUS_POLL_INTERVAL_S", "1.0")),
 )
 RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S = max(
     0.1,

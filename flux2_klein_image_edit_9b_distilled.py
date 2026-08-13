@@ -76,7 +76,7 @@ APP_DEBUG = os.getenv("APP_DEBUG", "0").strip().lower() in {"1", "true", "yes", 
 APP_QUIET = os.getenv("APP_QUIET", "1").strip().lower() in {"1", "true", "yes", "on"}
 RUNPOD_STATUS_POLL_INTERVAL_S = max(
     0.1,
-    float(os.getenv("RUNPOD_STATUS_POLL_INTERVAL_S", "0.4")),
+    float(os.getenv("RUNPOD_STATUS_POLL_INTERVAL_S", "1.0")),
 )
 MAX_STATUS_POLLS = int(os.getenv("RUNPOD_MAX_STATUS_POLLS", "1800"))
 PROMPT_LIBRARY_PATH = Path(
