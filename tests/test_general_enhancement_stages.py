@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -83,6 +86,87 @@ class GeneralProgressDisplayTests(unittest.TestCase):
         self.assertEqual(general._effective_stage_total(stage), 1)
 
 
+class GeneralPreparationWaitTests(unittest.TestCase):
+    def _wait_message(
+        self,
+        status: dict[str, object],
+        *,
+        runpod_state: str,
+        elapsed: float,
+    ) -> str:
+        state = _poll_state()
+        state.submitted_at = 1000.0
+        return general._describe_general_wait(
+            status,
+            state,
+            runpod_state=runpod_state,
+            now=1000.0 + elapsed,
+        )
+
+    def test_queued_job_reports_worker_wait_not_a_comfyui_wait(self) -> None:
+        message = self._wait_message(
+            {"status": "IN_QUEUE"},
+            runpod_state="IN_QUEUE",
+            elapsed=95.0,
+        )
+
+        self.assertIn("Waiting for a free RunPod worker", message)
+        self.assertIn("queued 1m 35s", message)
+
+    def test_queued_job_prefers_runpod_reported_delay(self) -> None:
+        message = self._wait_message(
+            {"status": "IN_QUEUE", "delayTime": 12_000},
+            runpod_state="IN_QUEUE",
+            elapsed=3.0,
+        )
+
+        self.assertIn("queued 12s", message)
+
+    def test_silent_running_job_reports_worker_startup(self) -> None:
+        message = self._wait_message(
+            {"status": "IN_PROGRESS", "delayTime": 57_064},
+            runpod_state="IN_PROGRESS",
+            elapsed=0.0,
+        )
+
+        self.assertIn("Worker starting up: loading models", message)
+        self.assertIn("queued 57s", message)
+
+    def test_short_queue_delay_is_not_reported_as_a_wait(self) -> None:
+        message = self._wait_message(
+            {"status": "IN_PROGRESS", "delayTime": 107},
+            runpod_state="IN_PROGRESS",
+            elapsed=0.0,
+        )
+
+        self.assertIn("Worker starting up: loading models", message)
+        self.assertNotIn("queued", message)
+
+    def test_startup_elapsed_counts_from_first_running_poll(self) -> None:
+        state = _poll_state()
+        state.submitted_at = 1000.0
+        status = {"status": "IN_PROGRESS"}
+
+        general._describe_general_wait(
+            status, state, runpod_state="IN_PROGRESS", now=1060.0
+        )
+        message = general._describe_general_wait(
+            status, state, runpod_state="IN_PROGRESS", now=1090.0
+        )
+
+        # 60s of that wall time was queueing, so startup is 30s, not 90s.
+        self.assertIn("30s so far", message)
+
+    def test_malformed_delay_time_falls_back_to_local_clock(self) -> None:
+        message = self._wait_message(
+            {"status": "IN_QUEUE", "delayTime": "soon"},
+            runpod_state="IN_QUEUE",
+            elapsed=20.0,
+        )
+
+        self.assertIn("queued 20s", message)
+
+
 class GeneralJobStageTests(unittest.IsolatedAsyncioTestCase):
     async def test_uncertain_submission_points_to_jobs_without_retry(self) -> None:
         class UncertainAPI:
@@ -141,6 +225,34 @@ class GeneralJobStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0].kind, "cancelled")
         self.assertEqual(events[0].title, "Cancelled")
         self.assertIn("cancelled", events[0].message.lower())
+
+    async def test_trace_file_records_queue_delay_per_poll(self) -> None:
+        api = _StatusAPI({"status": "FAILED", "delayTime": 41_000})
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            trace_file = Path(tmp_dir) / "trace.jsonl"
+            state = _poll_state()
+            state.trace_file = trace_file
+
+            async for _ in general._poll_general_job(
+                api,
+                "job-1",
+                background_np=np.zeros((32, 40, 3), dtype=np.uint8),
+                state=state,
+                stream_enabled=False,
+            ):
+                pass
+
+            rows = [
+                json.loads(line)
+                for line in trace_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        events = [row["event"] for row in rows]
+        self.assertEqual(events, ["status_poll", "terminal_event"])
+        self.assertEqual(rows[0]["payload"]["snapshot"]["delayTime"], 41_000)
+        self.assertEqual(rows[0]["payload"]["resolved_state"], "FAILED")
 
     async def test_malformed_images_payload_is_returned_as_decode_error(self) -> None:
         result = await general._finalize_general_output(

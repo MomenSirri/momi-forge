@@ -25,6 +25,13 @@ if exist "%APP_SSL_CERTFILE%" if exist "%APP_SSL_KEYFILE%" set "APP_SCHEME=https
 set "WEBAPP_ORIGIN=%APP_SCHEME%://127.0.0.1:%APP_SERVER_PORT%"
 set "WEBAPP_API_PORT=%RUNPOD_MANAGEMENT_API_PORT%"
 
+rem Per-poll RunPod trace logs (JSONL, one file per job) used to diagnose long
+rem "Preparation" waits: they separate queue delay from worker startup time.
+rem Both values are only defaulted, so the parent environment wins - run
+rem `set RUNPOD_TRACE_DEBUG=0` before this script to launch without tracing.
+if not defined RUNPOD_TRACE_DEBUG set "RUNPOD_TRACE_DEBUG=1"
+if not defined RUNPOD_TRACE_DIR set "RUNPOD_TRACE_DIR=%ROOT%\trace_logs"
+
 rem The Python app and both Node services must sign portal tokens with the same
 rem value. .env is the single source of truth; the Node services only see it if
 rem this script exports it, because they do not read .env themselves.
@@ -63,6 +70,13 @@ echo [momi] HISTORY_PORTAL_URL=%HISTORY_PORTAL_URL%
 echo [momi] RUNPOD_MANAGEMENT_BACKEND_DIR=%RUNPOD_MANAGEMENT_BACKEND_DIR%
 echo [momi] RUNPOD_MANAGEMENT_DIST_DIR=%RUNPOD_MANAGEMENT_DIST_DIR%
 echo [momi] RUNPOD_MANAGEMENT_API_UPSTREAM_URL=%RUNPOD_MANAGEMENT_API_UPSTREAM_URL%
+echo [momi] RUNPOD_TRACE_DEBUG=%RUNPOD_TRACE_DEBUG%
+if not "%RUNPOD_TRACE_DEBUG%"=="0" (
+  set "TRACE_USAGE=unknown"
+  for /f "delims=" %%I in ('powershell -NoProfile -Command "$d='%RUNPOD_TRACE_DIR%'; if (Test-Path -LiteralPath $d) { $f = @(Get-ChildItem -LiteralPath $d -Filter 'runpod_trace_*.jsonl' -File -ErrorAction SilentlyContinue); $s = ($f | Measure-Object -Property Length -Sum).Sum; if (-not $s) { $s = 0 }; '{0} files, {1:N0} MB' -f $f.Count, ($s/1MB) } else { 'empty' }"') do set "TRACE_USAGE=%%I"
+  echo [momi] RUNPOD_TRACE_DIR=%RUNPOD_TRACE_DIR%
+  call echo [momi] Trace logs on ^(%%TRACE_USAGE%%^). The app keeps only the newest ones.
+)
 echo.
 
 echo [momi] Reclaiming port %HISTORY_PORTAL_PORT% if occupied...

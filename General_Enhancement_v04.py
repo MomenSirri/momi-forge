@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,10 +49,14 @@ from workflow_progress import (
     extract_node_id,
 )
 from utils import (
+    _append_trace_event,
     _extract_progress_signal,
     _extract_stream_progress_signals,
     _has_final_output_payload,
+    _init_trace_file,
     _render_idle_status,
+    _status_trace_snapshot,
+    _stream_trace_snapshot,
     prepare_json,
     save_input_image_as_base64,
 )
@@ -98,7 +103,10 @@ RUNPOD_STREAM_ENABLED = os.getenv("RUNPOD_STREAM_ENABLED", "1").strip().lower() 
     "on",
 }
 TERMINAL_FAILURES = {"FAILED", "ERROR", "TIMED_OUT"}
-ACTIVE_STATES = {"IN_QUEUE", "IN_PROGRESS", "RUNNING"}
+QUEUED_STATE = "IN_QUEUE"
+ACTIVE_STATES = {QUEUED_STATE, "IN_PROGRESS", "RUNNING"}
+# Queue waits shorter than this are normal scheduling noise, not worth reporting.
+QUEUE_WAIT_NOTE_THRESHOLD_S = 5.0
 
 GENERAL_WORKFLOW_FILE = os.getenv("GENERAL_WORKFLOW_FILE", "").strip()
 GENERAL_WORKFLOW_PATH = os.getenv("GENERAL_WORKFLOW_PATH", "").strip()
@@ -854,6 +862,9 @@ class GeneralPollState:
     stream_seen_signatures: set[str] = field(default_factory=set)
     stream_seen_order: list[str] = field(default_factory=list)
     stream_task: asyncio.Task[dict[str, Any]] | None = None
+    trace_file: Path | None = None
+    submitted_at: float = field(default_factory=time.monotonic)
+    execution_started_at: float | None = None
 
     def cancel_stream(self) -> None:
         if self.stream_task is not None and not self.stream_task.done():
@@ -1187,6 +1198,7 @@ async def _advance_general_stream(
     state: GeneralPollState,
     *,
     stream_enabled: bool,
+    poll_idx: int = 0,
 ) -> tuple[list[tuple[int | float | None, str, list[str]]], str | None]:
     entries: list[tuple[int | float | None, str, list[str]]] = []
     stream_state: str | None = None
@@ -1195,18 +1207,117 @@ async def _advance_general_stream(
     if state.stream_task is not None and state.stream_task.done():
         try:
             response = state.stream_task.result()
+            _append_trace_event(
+                state.trace_file,
+                "stream_poll",
+                {
+                    "poll_idx": poll_idx,
+                    "snapshot": _stream_trace_snapshot(response),
+                },
+            )
             entries, stream_state = _extract_stream_progress_signals(
                 response,
                 seen_signatures=state.stream_seen_signatures,
                 seen_order=state.stream_seen_order,
             )
+            if entries:
+                _append_trace_event(
+                    state.trace_file,
+                    "stream_progress_batch",
+                    {
+                        "poll_idx": poll_idx,
+                        "entries": len(entries),
+                        "tail": [entry[1] for entry in entries[-3:]],
+                    },
+                )
         except Exception as err:
             logger.debug("Stream poll failed: %s", err)
+            _append_trace_event(
+                state.trace_file,
+                "stream_poll_error",
+                {"poll_idx": poll_idx, "error": str(err)},
+            )
         finally:
             state.stream_task = None
     if state.stream_task is None:
         state.stream_task = asyncio.create_task(api.stream(job_id))
     return entries, stream_state
+
+
+def _runpod_delay_seconds(status: dict[str, Any]) -> float | None:
+    raw = status.get("delayTime")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+        return None
+    return float(raw) / 1000.0
+
+
+def _format_wait_duration(seconds: float) -> str:
+    total = int(max(0.0, seconds))
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m {total % 60:02d}s"
+
+
+def _describe_general_wait(
+    status: dict[str, Any],
+    state: GeneralPollState,
+    *,
+    runpod_state: str,
+    now: float | None = None,
+) -> str:
+    """Explain a silent Preparation phase.
+
+    RunPod reports IN_QUEUE and IN_PROGRESS as separate waits that look
+    identical from the UI: neither emits ComfyUI progress. IN_QUEUE means no
+    worker is free yet; IN_PROGRESS with no ComfyUI output means a worker is
+    booting the container and loading models.
+    """
+    now = time.monotonic() if now is None else now
+    delay_seconds = _runpod_delay_seconds(status)
+    if runpod_state == QUEUED_STATE:
+        waited = (
+            delay_seconds if delay_seconds is not None else now - state.submitted_at
+        )
+        return (
+            "Waiting for a free RunPod worker "
+            f"(queued {_format_wait_duration(waited)})..."
+        )
+
+    if state.execution_started_at is None:
+        state.execution_started_at = now
+    queued_note = (
+        f", queued {_format_wait_duration(delay_seconds)}"
+        if delay_seconds is not None
+        and delay_seconds >= QUEUE_WAIT_NOTE_THRESHOLD_S
+        else ""
+    )
+    return (
+        "Worker starting up: loading models "
+        f"({_format_wait_duration(now - state.execution_started_at)} so far"
+        f"{queued_note})..."
+    )
+
+
+def _general_phase_trace_snapshot(tracker: ProgressTracker) -> dict[str, Any]:
+    stages = tracker.get("stages") or {}
+    return {
+        "phase": tracker.get("phase"),
+        "current_stage": tracker.get("current_stage"),
+        "current_status": tracker.get("current_status"),
+        "wrap_ratio": tracker.get("wrap_ratio"),
+        "tile_count": tracker.get("tile_count"),
+        "stages": {
+            key: {
+                "enabled": stage.get("enabled"),
+                "started": stage.get("started"),
+                "finished": stage.get("finished"),
+                "done": stage.get("done"),
+                "total": stage.get("total"),
+            }
+            for key, stage in stages.items()
+            if isinstance(stage, dict)
+        },
+    }
 
 
 def _update_general_poll_progress(
@@ -1246,8 +1357,10 @@ def _update_general_poll_progress(
         runpod_state in ACTIVE_STATES
         and state.progress_tracker["phase"] == PHASE_PREPARATION
     ):
-        state.progress_tracker["current_status"] = (
-            "Waiting for next ComfyUI update..."
+        state.progress_tracker["current_status"] = _describe_general_wait(
+            status,
+            state,
+            runpod_state=runpod_state,
         )
 
     overall_percent = max(
@@ -1372,11 +1485,21 @@ async def _poll_general_job(
                 job_id,
                 state,
                 stream_enabled=stream_enabled,
+                poll_idx=poll_idx,
             )
             try:
                 status = await api.status(job_id)
             except Exception as err:
                 state.consecutive_status_errors += 1
+                _append_trace_event(
+                    state.trace_file,
+                    "status_poll_error",
+                    {
+                        "poll_idx": poll_idx,
+                        "error": str(err),
+                        "consecutive_errors": state.consecutive_status_errors,
+                    },
+                )
                 if state.consecutive_status_errors > MAX_CONSECUTIVE_STATUS_ERRORS:
                     yield GeneralPollEvent(
                         kind="status_error",
@@ -1406,6 +1529,15 @@ async def _poll_general_job(
 
             state.consecutive_status_errors = 0
             runpod_state = (status.get("status") or stream_state or "").upper()
+            _append_trace_event(
+                state.trace_file,
+                "status_poll",
+                {
+                    "poll_idx": poll_idx,
+                    "resolved_state": runpod_state,
+                    "snapshot": _status_trace_snapshot(status),
+                },
+            )
             terminal_event = await _general_terminal_event(
                 status,
                 runpod_state=runpod_state,
@@ -1416,19 +1548,40 @@ async def _poll_general_job(
                 state=state,
             )
             if terminal_event is not None:
+                _append_trace_event(
+                    state.trace_file,
+                    "terminal_event",
+                    {
+                        "poll_idx": poll_idx,
+                        "kind": terminal_event.kind,
+                        "message": terminal_event.message[:300],
+                    },
+                )
                 yield terminal_event
                 if terminal_event.kind != "finalizing":
                     return
                 await asyncio.sleep(RUNPOD_STATUS_ERROR_RETRY_INTERVAL_S)
                 continue
 
-            yield _update_general_poll_progress(
+            progress_event = _update_general_poll_progress(
                 status,
                 stream_entries,
                 state,
                 poll_idx=poll_idx,
                 runpod_state=runpod_state,
             )
+            _append_trace_event(
+                state.trace_file,
+                "phase_update",
+                {
+                    "poll_idx": poll_idx,
+                    "resolved_state": runpod_state,
+                    "overall_percent": progress_event.progress_percent,
+                    "message": progress_event.message,
+                    "tracker": _general_phase_trace_snapshot(state.progress_tracker),
+                },
+            )
+            yield progress_event
             if (
                 state.completion_hint_seen_at is not None
                 and poll_idx - state.completion_hint_seen_at
@@ -1452,6 +1605,11 @@ async def _poll_general_job(
                 return
             await asyncio.sleep(RUNPOD_STATUS_POLL_INTERVAL_S)
 
+        _append_trace_event(
+            state.trace_file,
+            "poll_timeout",
+            {"poll_idx": MAX_STATUS_POLLS},
+        )
         yield GeneralPollEvent(
             kind="timeout",
             status={},
@@ -1755,10 +1913,28 @@ async def enhance_image(
         task_url=f"{api.base_url}/status/{job_id}",
         retry_count=0,
     )
+    trace_file = _init_trace_file(job_id=job_id, workflow=workflow)
+    _append_trace_event(
+        trace_file,
+        "job_submitted",
+        {
+            "job_id": job_id,
+            "workflow": workflow,
+            "general_enhance": general_enhance,
+            "advance_details": advance_details,
+            "body_enhance": body_enhance,
+            "tracker": _general_phase_trace_snapshot(source.progress_tracker),
+            "trace_file": str(trace_file),
+        },
+    )
     if prepared_job.workflow_debug_path is not None:
         source.progress_tracker["current_status"] = (
             "Job submitted. Debug JSON saved: "
             f"{prepared_job.workflow_debug_path}"
+        )
+    elif trace_file is not None:
+        source.progress_tracker["current_status"] = (
+            f"Job submitted. Debug trace file: {trace_file}"
         )
     else:
         source.progress_tracker["current_status"] = (
@@ -1773,7 +1949,10 @@ async def enhance_image(
         job_id,
     )
 
-    poll_state = GeneralPollState(progress_tracker=source.progress_tracker)
+    poll_state = GeneralPollState(
+        progress_tracker=source.progress_tracker,
+        trace_file=trace_file,
+    )
     async for event in _poll_general_job(
         api,
         job_id,

@@ -153,6 +153,17 @@ $env:RUNPOD_MANAGEMENT_API_PORT = '8843'
 $env:RUNPOD_MANAGEMENT_API_UPSTREAM_URL = 'https://127.0.0.1:8843'
 $env:WEBAPP_API_PORT = '8843'
 
+# Per-poll RunPod trace logs (JSONL in trace_logs\), used to tell a queue wait
+# apart from worker startup when a job sits in "Preparation". Unlike the values
+# above these are only defaulted, so a machine-level RUNPOD_TRACE_DEBUG=0 turns
+# tracing off for the boot service without editing this file.
+if ([string]::IsNullOrWhiteSpace($env:RUNPOD_TRACE_DEBUG)) {
+    $env:RUNPOD_TRACE_DEBUG = '1'
+}
+if ([string]::IsNullOrWhiteSpace($env:RUNPOD_TRACE_DIR)) {
+    $env:RUNPOD_TRACE_DIR = Join-Path $root 'trace_logs'
+}
+
 $sslAvailable =
     (Test-Path -LiteralPath $env:APP_SSL_CERTFILE -PathType Leaf) -and
     (Test-Path -LiteralPath $env:APP_SSL_KEYFILE -PathType Leaf)
@@ -196,6 +207,18 @@ if ($ValidateOnly) {
 
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $supervisorLog = Join-Path $logDir "$logPrefix-supervisor.log"
+
+if ($Component -eq 'App') {
+    # Nobody sees a console banner in the SYSTEM session, so record whether
+    # tracing is on. The app prunes trace files to RUNPOD_TRACE_RETENTION_FILES.
+    $traceState = if ($env:RUNPOD_TRACE_DEBUG -eq '0') {
+        'off'
+    }
+    else {
+        "on -> $($env:RUNPOD_TRACE_DIR)"
+    }
+    Add-Content -LiteralPath $supervisorLog -Encoding UTF8 -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss K')] RunPod trace logs $traceState."
+}
 
 while ($true) {
     # Keep the latest 30 process runs for this component. A port conflict or a

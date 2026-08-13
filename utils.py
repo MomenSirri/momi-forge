@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-import tempfile
 from typing import Any
 
 from workflow_progress import clamp_ratio
@@ -90,9 +89,36 @@ DEFAULT_WRAP_UP_MILESTONES = {
     "81:13": 0.55,
     "97": 0.75,
 }
-# Trace logging is disabled for production/client-facing runs.
-RUNPOD_TRACE_DEBUG = False
-RUNPOD_TRACE_DIR = Path(os.getenv("RUNPOD_TRACE_DIR", tempfile.gettempdir()))
+# Trace logging stays off for production/client-facing runs; set
+# RUNPOD_TRACE_DEBUG=1 to capture per-poll JSONL traces when diagnosing stalls.
+RUNPOD_TRACE_DEBUG = os.getenv("RUNPOD_TRACE_DEBUG", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RUNPOD_TRACE_DIR = Path(
+    os.getenv("RUNPOD_TRACE_DIR", str(Path(__file__).resolve().parent / "trace_logs"))
+)
+TRACE_FILENAME_GLOB = "runpod_trace_*.jsonl"
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s.", name, raw, default)
+        return default
+
+
+# One trace file per job, so the boot service would otherwise accumulate them
+# forever. Mirrors the "keep the latest N" retention the startup supervisor uses
+# for its own logs. Set to 0 to keep every trace file.
+RUNPOD_TRACE_RETENTION_FILES = _int_env("RUNPOD_TRACE_RETENTION_FILES", 200)
 DB_PATH = os.getenv("USER_DB_PATH", "users.db")
 WORKFLOW_FILENAME = os.getenv("MOMI_WORKFLOW_FILE", "Seedvr_flux_upscaler_03.json")
 MOMI_WORKFLOW_PROFILES_FILE = os.getenv("MOMI_WORKFLOW_PROFILES_FILE", "").strip()
@@ -687,12 +713,59 @@ def _extract_stream_progress_signals(
 
 
 # ---- Trace and reconciliation helpers ----
+def _prune_trace_files(*, keep: int | None = None) -> list[Path]:
+    """Delete all but the newest ``keep`` trace files. Never raises.
+
+    Only files matching TRACE_FILENAME_GLOB directly inside RUNPOD_TRACE_DIR are
+    considered, so anything else living in that folder is left untouched.
+    """
+    limit = RUNPOD_TRACE_RETENTION_FILES if keep is None else keep
+    if limit <= 0:
+        return []
+
+    removed: list[Path] = []
+    try:
+        traces: list[tuple[float, Path]] = []
+        for path in RUNPOD_TRACE_DIR.glob(TRACE_FILENAME_GLOB):
+            try:
+                if path.is_file():
+                    traces.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+
+        if len(traces) <= limit:
+            return []
+
+        traces.sort(key=lambda entry: entry[0], reverse=True)
+        for _, path in traces[limit:]:
+            try:
+                path.unlink()
+            except OSError as err:
+                logger.warning("Could not delete stale trace file %s: %s", path, err)
+                continue
+            removed.append(path)
+    except Exception as err:
+        logger.warning("Trace log pruning failed in %s: %s", RUNPOD_TRACE_DIR, err)
+        return removed
+
+    if removed:
+        logger.info(
+            "Pruned %s stale trace file(s) in %s (keeping newest %s).",
+            len(removed),
+            RUNPOD_TRACE_DIR,
+            limit,
+        )
+    return removed
+
+
 def _init_trace_file(job_id: str, workflow: str) -> Path | None:
     if not RUNPOD_TRACE_DEBUG:
         return None
 
     try:
         RUNPOD_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        # Sweep before naming the new file so it is never a deletion candidate.
+        _prune_trace_files()
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         safe_workflow = re.sub(r"[^a-zA-Z0-9._-]", "_", workflow)[:64]
         filename = f"runpod_trace_{safe_workflow}_{job_id}_{timestamp}.jsonl"
